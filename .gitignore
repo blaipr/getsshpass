@@ -1,0 +1,12 @@
+# Runtime state directory
+.getsshpass/
+
+# Temp files from interrupted/resumed runs
+*.new
+
+# Downloaded wordlists (from --fetch)
+users.txt
+top-usernames-shortlist.txt
+rockyou.txt
+10k-most-common.txt
+100k-passwords.txt
