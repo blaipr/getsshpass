@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1] - 2026-05-15
+
+Switched default password delivery to `SSH_ASKPASS`; redesigned terminal output with pinned counters.
+
+### Added
+
+- `SSH_ASKPASS` method for passing passwords to SSH
+- `-s/--sshpass` flag to use `sshpass` instead of `SSH_ASKPASS`
+- ASCII banner in `--help` (version watermark) and `--version` (copyright info)
+- `print_attack_config` prints Target, SSH method, parallel jobs, delay, timeout, and retries before pre-flight
+- Resume stats block shows Users, Passwords, Combinations, and Previously tried before `Starting attack...`
+- `Passwords tried` and `Passwords remaining` lines pinned after `Starting attack...` via ANSI DSR; update live
+- Cursor hidden during attack (`\033[?25l`), restored on teardown
+- EXIT trap resets scroll region and restores cursor unconditionally on any exit
+- Both username and password file errors reported together before exiting
+- `RETRY_SLEEP` (0.05s, retry backoff) and `POLL_SLEEP` (0.05s, job-slot polling) constants
+- OpenSSH version check at startup: exits with an error if the client is older than 8.4 when using default SSH_ASKPASS mode
+- SSH exit 255 disambiguated via stderr: `Permission denied` = auth failure, else connection error
+- `-o NumberOfPasswordPrompts=1` added to `SSH_ASKPASS` calls to fail fast on bad passwords
+
+### Changed
+
+- `wait_for_job_slot` replaced `jobs -rp | wc -l` with `${#CHILD_PIDS[@]}` (no forked subshells)
+- `format_number` writes into a named variable via `printf -v`; inline duplicates removed
+- Default SSH password delivery method is now `SSH_ASKPASS`
+- `-l/--list` column width calculated dynamically from catalog content
+- Startup counts (Users, Passwords, Combinations) shown as separate labeled lines before `Starting attack...`
+- Help text no longer shown after error messages
+- `maxusercount`/`maxpasscount` set once in `restore_progress`; duplicate `grep -c` calls removed
+- Retry backoff sleep uses fixed `RETRY_SLEEP` (0.05s) instead of `${delay}`; retry frequency is now independent of `--delay`
+- Script moved to `src/getsshpass.sh`
+
+### Fixed
+
+- `check_ssh_connection` sshpass path: exit 3 now treated as connection error (was: fell through to "Connection successful")
+
 ## [1.0] - 2026-05-11
 
 Complete rewrite of the codebase with security hardening, modern bash practices, and new features.
