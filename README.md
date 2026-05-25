@@ -72,7 +72,7 @@ getsshpass/
 
 ## Requirements
 
-- Bash 4.2+
+- Bash 4.4+
 - ssh (OpenSSH 8.4+ client required for default SSH_ASKPASS mode; any version works with `-s/--sshpass`)
 - curl (optional, for `--fetch` wordlist feature)
 - sshpass (optional, for `-s/--sshpass` mode)
@@ -121,8 +121,8 @@ Usage: getsshpass.sh [OPTIONS]
 OPTIONS:
    -a, --attack HOST      IP address or hostname of target SSH host
    -p, --port PORT        TCP port 1-65535 of target SSH host [default: 22]
-   -u, --users FILE       Path to file with usernames
-   -d, --dictionary FILE  Path to file with passwords
+   -u, --users FILE       Path to file with usernames (repeatable)
+   -d, --dictionary FILE  Path to file with passwords (repeatable)
    -w, --wait SECS        Delay between attempts in seconds (e.g. 1, 0.1, 0.0) [default: 0.04]
    -j, --jobs JOBS        Maximum parallel SSH attempts, 0 = unlimited [default: 0]
    -r, --retries N        Max retries per attempt on transient SSH errors [default: 50]
@@ -155,6 +155,18 @@ Maximum speed (no delay between attempts):
 ./getsshpass.sh -a 10.0.0.5 -u users.txt -d passwords.txt --wait 0.0
 ```
 
+Multiple wordlist files (concatenated in order):
+
+```bash
+./getsshpass.sh -a 192.168.1.1 -u admins.txt -u users.txt -d common.txt -d rockyou.txt
+```
+
+Password spray (try each password across all users before moving to the next):
+
+```bash
+./getsshpass.sh -a 192.168.1.1 -d rockyou.txt -u users.txt
+```
+
 ### Example output
 
 ```
@@ -165,11 +177,14 @@ $ ./getsshpass.sh -a 192.168.1.1 -p 22 -u users.txt -d passwords.txt -j 5
 2026-05-10 14:23:44 [INFO ] SSH delay:           0.04s
 2026-05-10 14:23:44 [INFO ] SSH timeout:         8s
 2026-05-10 14:23:44 [INFO ] SSH retries:         50
+2026-05-10 14:23:44 [INFO ] Users file:          users.txt
+2026-05-10 14:23:44 [INFO ] Passwords file:      passwords.txt
+2026-05-10 14:23:44 [INFO ] Attack order:        users first
 2026-05-10 14:23:44 [INFO ] Checking SSH connection to '192.168.1.1:22'...
 2026-05-10 14:23:46 [OK   ] Connection successful
 2026-05-10 14:23:46 [INFO ] Filtering users by password authentication...
 2026-05-10 14:23:51 [INFO ] 3/4 users allow password authentication
-2026-05-10 14:23:51 [INFO ] Users:                       3
+2026-05-10 14:23:51 [INFO ] Users:                       3 / 4
 2026-05-10 14:23:51 [INFO ] Passwords:                   4
 2026-05-10 14:23:51 [INFO ] Combinations:                12
 2026-05-10 14:23:51 [INFO ] Starting attack...
@@ -228,13 +243,13 @@ NAME|FILENAME|DESCRIPTION|URL
 
 1. **Connection check** - Connects to the target over SSH using `admin:admin` as a quick-win test: if the most common default credential succeeds immediately, there is no need to run the full dictionary attack and the script reports the finding and ends. All SSH commands use `-o StrictHostKeyChecking=no` (accept any host key) and `-o PubkeyAuthentication=no` (force password authentication). In default mode (`SSH_ASKPASS`), `-o NumberOfPasswordPrompts=1` is also set to fail fast on bad passwords; SSH exits with 255 for both authentication failure and connection errors, so the script captures stderr to tell them apart: `Permission denied` in the output means the server is reachable but rejected the password - attack proceeds; anything else with exit 255 is a real connection failure and the script exits. In `--sshpass` mode, `NumberOfPasswordPrompts=1` is omitted because sshpass relies on detecting the second password prompt to return exit code 5 for authentication failure; sshpass returns distinct exit codes (5 = auth failure, 3/255 = connection error) so no stderr capture is needed.
 
-2. **User filtering** - Probes all usernames in parallel from the wordlist using `ssh -o BatchMode=yes`. When BatchMode is enabled, SSH will not prompt for a password - if the server responds mentioning "password" or "keyboard-interactive" in its output, that user has password-based authentication enabled. Users that only accept key-based authentication are skipped. Note: filtering always runs all probes simultaneously with no concurrency cap, regardless of `-j/--jobs` - with a large username list this can open many connections to the target at once. If no users in the list have password authentication enabled, the script exits immediately with `[WARN ] No users with password authentication found` and does not run the attack. Each parallel probe writes a marker file named after the user into a temporary directory `filter_tmp/` inside the host's state directory. Once all probes complete, the script rebuilds `filtered_users.txt` by reading back the original userlist in order and including only users that have a marker file in `filter_tmp/`, preserving the original input order. `filter_tmp/` is deleted immediately after. On subsequent runs against the same host, if a cached `filtered_users.txt` already exists, the script asks whether to reuse it (`Reuse cached list? [Y/n]`) - defaulting to Yes - so the filtering step can be skipped entirely.
+2. **User filtering** - Probes all usernames in parallel from the wordlist using `ssh -o BatchMode=yes`. When BatchMode is enabled, SSH will not prompt for a password - if the server responds mentioning "password" or "keyboard-interactive" in its output, that user has password-based authentication enabled. Users that only accept key-based authentication are skipped. When `-j/--jobs` is set, filtering respects the same concurrency cap; otherwise all probes run simultaneously - with a large username list this can open many connections to the target at once. If no users in the list have password authentication enabled, the script exits immediately with `[WARN ] No users with password authentication found` and does not run the attack. Each parallel probe writes a marker file named after the user into a temporary directory `filter_tmp/` inside the host's state directory. Once all probes complete, the script rebuilds `filtered_users.txt` by reading back the original userlist in order and including only users that have a marker file in `filter_tmp/`, preserving the original input order. `filter_tmp/` is deleted immediately after. On subsequent runs against the same host, if a cached `filtered_users.txt` already exists, the script asks whether to reuse it (`Reuse cached list? [Y/n]`) - defaulting to Yes - so the filtering step can be skipped entirely.
 
 3. **Resume detection** - If a previous run was interrupted, the script detects `resume.txt` and restores progress from the last attempted credential pair (see [State files](#state-files) below).
 
-4. **Dictionary attack** - Tries every username/password combination using parallel background jobs. By default, parallelism is unlimited; use `-j/--jobs` to cap the number of concurrent SSH sessions. When `-j` is set, the script polls every 50ms for a free job slot before launching the next attempt. A delay (`-w/--wait`) is applied between attempts to avoid overwhelming the target or triggering rate limiting. Retries on transient SSH errors use a fixed 50ms sleep independent of `-w/--wait`, up to `-r/--retries` (default: 50) retries per attempt. If the retry limit is hit, the script emits a `[WARN ]` message and skips that credential pair - the attack continues with the next one. If one job finds the password, all other jobs that are mid-retry detect the result file and stop immediately without exhausting their remaining retries. Finished child PIDs are pruned from the tracking array every 100 attempts - so the signal handler's cleanup loop only iterates over live processes, avoiding unnecessary `kill` and `wait` calls.
+4. **Dictionary attack** - The relative position of the first `-u` and first `-d` argument determines the outer loop: `-u` before `-d` iterates users as the outer loop (all passwords tried per user before moving to the next user); `-d` before `-u` iterates passwords as the outer loop, which is the classic password spray pattern (one password tried across all users before moving to the next password). The chosen order is shown in the pre-flight summary as `Attack order`. If multiple `-u/--users` or `-d/--dictionary` files are given, each set is concatenated into a single temporary file in the order specified before the attack starts. Tries every username/password combination using parallel background jobs. By default, parallelism is unlimited; use `-j/--jobs` to cap the number of concurrent SSH sessions. When `-j` is set, the script polls every 50ms for a free job slot before launching the next attempt. A delay (`-w/--wait`) is applied between attempts to avoid overwhelming the target or triggering rate limiting. Retries on transient SSH errors use a fixed 50ms sleep independent of `-w/--wait`, up to `-r/--retries` (default: 50) retries per attempt. If the retry limit is hit, the script emits a `[WARN ]` message and skips that credential pair - the attack continues with the next one. If one job finds the password, all other jobs that are mid-retry detect the result file and stop immediately without exhausting their remaining retries. Finished child PIDs are pruned from the tracking array when it exceeds `PID_PRUNE_THRESHOLD` (200) entries, so the signal handler's cleanup loop only iterates over live processes, avoiding unnecessary `kill` and `wait` calls.
 
-5. **Result reporting** - On success, displays the found credentials and the time elapsed since the attack started (e.g. `16s`, `3m 29s`, `1d 2h 15m 3s`), then exits with code 0. On failure (all combinations exhausted), exits with code 1 after displaying the message: `Password not found. Try a different dictionary.` and the elapsed time. Note: the timer resets when the attack loop begins, so pre-flight checks and user filtering are not included.
+5. **Result reporting** - On success, emits a terminal bell (`\a`) to alert the user, displays the found credentials and the time elapsed since the attack started (e.g. `16s`, `3m 29s`, `1d 2h 15m 3s`), then exits with code 0. On failure (all combinations exhausted), exits with code 1 after displaying the message: `Password not found. Try a different dictionary.` and the elapsed time. Note: the timer resets when the attack loop begins, so pre-flight checks and user filtering are not included.
 
 ### SSH_ASKPASS mode (default)
 
@@ -300,11 +315,13 @@ The `-j/--jobs`, `-w/--wait`, and `-t/--timeout` flags control how aggressively 
 
 - **`-s/--sshpass` (sshpass mode)** - Use `sshpass` to pass passwords instead of the native `SSH_ASKPASS` mechanism. sshpass returns distinct exit codes for auth failure vs connection errors, avoiding the stderr capture overhead used in default mode. Requires `sshpass` installed.
 
-Two internal sleep constants are hardcoded in the script and are not exposed as flags:
+Three internal constants are hardcoded in the script and are not exposed as flags:
 
 - **`RETRY_SLEEP` (0.05s)** - Fixed delay between retries when a connection error occurs. Intentionally short and independent of `--wait` so that transient errors are retried quickly regardless of the configured attack delay.
 
 - **`POLL_SLEEP` (0.05s)** - Fixed delay between checks when waiting for a free job slot (`-j/--jobs` limit). Shorter values reduce slot-acquisition latency; longer values reduce CPU spinning.
+
+- **`PID_PRUNE_THRESHOLD` (200)** - The child PID tracking array is pruned of finished processes when it exceeds this many entries. Lower values prune more often (more `kill -0` probes, slightly more CPU); higher values let the array grow larger between prunes.
 
 To change these, edit the constants at the top of `src/getsshpass.sh`.
 

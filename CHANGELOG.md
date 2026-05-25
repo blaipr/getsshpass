@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2] - 2026-05-16
+
+IPv6 target support.
+
+### Added
+
+- IPv6 target support; RFC 3986 bracket notation (`[2001:db8::1]:22`)
+- Multiple password files: `-d` can be specified more than once; files are concatenated in order
+- Multiple username files: `-u` can be specified more than once; files are concatenated in order
+- User filtering parallelism capped by `-j/--jobs` when set
+- Attack order set by argument position: `-u` first = per-user; `-d` first = spray
+- `print_attack_config` shows username/password filenames and attack order before the attack
+- Terminal bell (`\a`) on password found to alert the user
+
+### Changed
+
+- `Users:` line shows filtered/total (e.g. `3 / 4`) when filtering removed users
+- `Trying user:` line no longer blinks; erase moved after content write
+- Resume recalculates progress correctly for both attack orders
+- Child PID pruning uses array-size threshold (`PID_PRUNE_THRESHOLD`) instead of every 100 attempts
+- `set -u` (nounset) enabled to catch unset variable expansions
+- `LC_ALL=C` exported for consistent regex matching and collation across locales
+
 ## [1.1] - 2026-05-15
 
 Switched default password delivery to `SSH_ASKPASS`; redesigned terminal output with pinned counters.

