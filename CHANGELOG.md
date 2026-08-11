@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3] - 2026-08-11
+
+Handle OpenSSH 9.8+ `PerSourcePenalties`, which previously caused correct passwords to be silently skipped ([issue #1](https://github.com/blaipr/getsshpass/issues/1)).
+
+### Added
+
+- Second-pass retry (`retry_skipped`): pairs that exhaust their retries are saved to `skipped.txt` and retried serially
+- Inconclusive result reported when pairs remain untested after the second pass, naming the `skipped.txt` path
+- Startup advisory about `PerSourcePenalties` when parallelism is aggressive (`-j 0` or `> 4`)
+- `sleep_ms` helper for millisecond-precision backoff
+- `RETRY_BACKOFF_BASE_MS`, `RETRY_BACKOFF_MAX_MS`, and `RETRY_MAX_WAIT_MS` constants
+- Startup check requiring bash 4.4+, with a clear error on older bash (e.g. macOS's 3.2)
+- Optional SHA-256 verification of `--fetch` downloads when the catalog pins a checksum
+
+### Changed
+
+- Connection-error retries now use exponential backoff (50 ms doubling to a 5 s cap), replacing the fixed `RETRY_SLEEP`
+- Retries are bounded by a 30 s cumulative per-pair budget (`RETRY_MAX_WAIT_MS`) before deferring the pair to the second pass
+- `try_ssh` records exhausted pairs to `skipped.txt` instead of printing a background "Max retries" warning
+
+### Fixed
+
+- Hardened `rm -rf` in `clear_state_files` against an empty base path (`${STATE_BASE:?}`)
+- `SCRIPT_DIR` assignment no longer masks a failed command substitution
+
 ## [1.2] - 2026-05-16
 
 IPv6 target support.

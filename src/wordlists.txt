@@ -1,5 +1,7 @@
 # Wordlist catalog for getsshpass --fetch
-# Format: NAME|FILENAME|DESCRIPTION|URL
+# Format: NAME|FILENAME|DESCRIPTION|URL|SHA256
+# SHA256 (5th field) is optional and verified after download when present;
+# pin it only for immutable URLs (release assets), not mutable branch URLs.
 # Lines starting with # are ignored
 top-usernames|top-usernames-shortlist.txt|17 top usernames, 1 KB|https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt
 rockyou|rockyou.txt|14.3M passwords, 134 MB|https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt

