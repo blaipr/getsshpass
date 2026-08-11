@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: Syntax (bash -n)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n src/getsshpass.sh
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+          shellcheck src/getsshpass.sh
+
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Show bash version
+        run: bash --version | head -1
+      - name: Run tests
+        run: bats tests/
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # macOS ships bash 3.2; the tool needs bash 4.4+, so install a modern
+      # bash (as a macOS user would) and put it first on PATH.
+      - name: Install bash + bats
+        run: |
+          brew install bash bats-core
+          echo "$(brew --prefix)/bin" >> "${GITHUB_PATH}"
+      - name: Show bash version
+        run: bash --version | head -1
+      - name: Run tests
+        run: bats tests/

@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3] - 2026-08-11
+
+Handle OpenSSH 9.8+ `PerSourcePenalties`, which previously caused correct passwords to be silently skipped ([issue #1](https://github.com/blaipr/getsshpass/issues/1)).
+
+### Added
+
+- Second-pass retry (`retry_skipped`): pairs that exhaust their retries are saved to `skipped.txt` and retried serially
+- Inconclusive result reported when pairs remain untested after the second pass, naming the `skipped.txt` path
+- Startup advisory about `PerSourcePenalties` when parallelism is aggressive (`-j 0` or `> 4`)
+- `sleep_ms` helper for millisecond-precision backoff
+- `RETRY_BACKOFF_BASE_MS`, `RETRY_BACKOFF_MAX_MS`, and `RETRY_MAX_WAIT_MS` constants
+- CI workflow running `bash -n`, ShellCheck, and bats tests on Linux and macOS
+- Test suite in `tests/` (bats): unit tests for helpers, end-to-end tests with a stub `ssh`
+- Issue and pull request templates, `SECURITY.md`, `.editorconfig`, and `.shellcheckrc`
+
+### Changed
+
+- Connection-error retries now use exponential backoff (50 ms doubling to a 5 s cap), replacing the fixed `RETRY_SLEEP`
+- Retries are bounded by a 30 s cumulative per-pair budget (`RETRY_MAX_WAIT_MS`) before deferring the pair to the second pass
+- `try_ssh` records exhausted pairs to `skipped.txt` instead of printing a background "Max retries" warning
+- Script is now ShellCheck-clean (`enable=all`) with no suppressions
+- Script can be sourced without running `main` (via a `BASH_SOURCE` guard) so the test suite can load it
+- Hardened `rm -rf` in `clear_state_files` with `${STATE_BASE:?}`
+
 ## [1.2] - 2026-05-16
 
 IPv6 target support.

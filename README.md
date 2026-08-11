@@ -63,12 +63,36 @@ getsshpass/
 │           │   └── <user>           # Marker file per user with password authentication enabled
 │           ├── filtered_users.txt   # Users with password authentication enabled
 │           ├── result.txt           # Found credentials
-│           └── resume.txt           # Last attempted username:password
+│           ├── resume.txt           # Last attempted username:password
+│           └── skipped.txt          # Pairs left untested after retries (connection penalties)
+├── tests/
+│   ├── helpers.bats          # Unit tests for pure helper functions
+│   └── integration.bats      # End-to-end tests with a stub ssh
+├── .github/
+│   ├── workflows/ci.yml      # CI: bash -n, ShellCheck, bats (Linux + macOS)
+│   ├── ISSUE_TEMPLATE/       # Bug report and feature request templates
+│   ├── dependabot.yml        # Weekly updates for GitHub Actions
+│   └── pull_request_template.md
+├── .editorconfig          # Editor settings (2-space indent, 80 cols)
+├── .shellcheckrc          # ShellCheck configuration
 ├── CHANGELOG.md           # Version history
 ├── CONTRIBUTING.md        # Contribution guidelines
+├── SECURITY.md            # Security policy and responsible-use notice
 ├── LICENSE                # GPLv3+ license
 └── README.md              # This file
 ```
+
+## Testing
+
+Unit and integration tests use [bats](https://github.com/bats-core/bats-core):
+
+```
+bats tests/
+```
+
+The integration tests stub `ssh` on `PATH` to simulate connection behaviour
+(including OpenSSH `PerSourcePenalties` drops), so no live SSH server is
+required. CI runs `bash -n`, ShellCheck, and the test suite on Linux and macOS.
 
 ## Requirements
 
@@ -247,9 +271,9 @@ NAME|FILENAME|DESCRIPTION|URL
 
 3. **Resume detection** - If a previous run was interrupted, the script detects `resume.txt` and restores progress from the last attempted credential pair (see [State files](#state-files) below).
 
-4. **Dictionary attack** - The relative position of the first `-u` and first `-d` argument determines the outer loop: `-u` before `-d` iterates users as the outer loop (all passwords tried per user before moving to the next user); `-d` before `-u` iterates passwords as the outer loop, which is the classic password spray pattern (one password tried across all users before moving to the next password). The chosen order is shown in the pre-flight summary as `Attack order`. If multiple `-u/--users` or `-d/--dictionary` files are given, each set is concatenated into a single temporary file in the order specified before the attack starts. Tries every username/password combination using parallel background jobs. By default, parallelism is unlimited; use `-j/--jobs` to cap the number of concurrent SSH sessions. When `-j` is set, the script polls every 50ms for a free job slot before launching the next attempt. A delay (`-w/--wait`) is applied between attempts to avoid overwhelming the target or triggering rate limiting. Retries on transient SSH errors use a fixed 50ms sleep independent of `-w/--wait`, up to `-r/--retries` (default: 50) retries per attempt. If the retry limit is hit, the script emits a `[WARN ]` message and skips that credential pair - the attack continues with the next one. If one job finds the password, all other jobs that are mid-retry detect the result file and stop immediately without exhausting their remaining retries. Finished child PIDs are pruned from the tracking array when it exceeds `PID_PRUNE_THRESHOLD` (200) entries, so the signal handler's cleanup loop only iterates over live processes, avoiding unnecessary `kill` and `wait` calls.
+4. **Dictionary attack** - The relative position of the first `-u` and first `-d` argument determines the outer loop: `-u` before `-d` iterates users as the outer loop (all passwords tried per user before moving to the next user); `-d` before `-u` iterates passwords as the outer loop, which is the classic password spray pattern (one password tried across all users before moving to the next password). The chosen order is shown in the pre-flight summary as `Attack order`. If multiple `-u/--users` or `-d/--dictionary` files are given, each set is concatenated into a single temporary file in the order specified before the attack starts. Tries every username/password combination using parallel background jobs. By default, parallelism is unlimited; use `-j/--jobs` to cap the number of concurrent SSH sessions. When `-j` is set, the script polls every 50ms for a free job slot before launching the next attempt. A delay (`-w/--wait`) is applied between attempts to avoid overwhelming the target or triggering rate limiting. Retries on transient SSH errors use exponential backoff (50ms doubling to a 5s cap) independent of `-w/--wait`, bounded by `-r/--retries` (default: 50) and a 30s cumulative per-pair budget (`RETRY_MAX_WAIT_MS`). When a pair exhausts its retries - which usually means an OpenSSH 9.8+ `PerSourcePenalties` block is dropping the connection - it is recorded to `skipped.txt` rather than silently discarded, and the attack continues with the next pair; skipped pairs are retried in a serial second pass once the main run finishes (see step 5). If one job finds the password, all other jobs that are mid-retry detect the result file and stop immediately without exhausting their remaining retries. Finished child PIDs are pruned from the tracking array when it exceeds `PID_PRUNE_THRESHOLD` (200) entries, so the signal handler's cleanup loop only iterates over live processes, avoiding unnecessary `kill` and `wait` calls.
 
-5. **Result reporting** - On success, emits a terminal bell (`\a`) to alert the user, displays the found credentials and the time elapsed since the attack started (e.g. `16s`, `3m 29s`, `1d 2h 15m 3s`), then exits with code 0. On failure (all combinations exhausted), exits with code 1 after displaying the message: `Password not found. Try a different dictionary.` and the elapsed time. Note: the timer resets when the attack loop begins, so pre-flight checks and user filtering are not included.
+5. **Second-pass retry and result reporting** - When the main loop finishes, any pairs recorded in `skipped.txt` are retried serially (`retry_skipped`) - running one connection at a time lets a `PerSourcePenalties` block decay, so pairs skipped during the parallel flood can still be tested before a verdict is reached. On success, emits a terminal bell (`\a`) to alert the user, displays the found credentials and the time elapsed since the attack started (e.g. `16s`, `3m 29s`, `1d 2h 15m 3s`), removes `skipped.txt`, then exits with code 0. On failure, exits with code 1: if every combination was actually tested it displays `Password not found. Try a different dictionary.`; if some pairs remained untested even after the second pass, it instead reports an `INCONCLUSIVE` result, names the `skipped.txt` file, and suggests gentler settings (`-j 1 -w 5`) so the reader knows the wordlist was not fully covered. Note: the timer resets when the attack loop begins, so pre-flight checks and user filtering are not included.
 
 ### SSH_ASKPASS mode (default)
 
@@ -315,9 +339,11 @@ The `-j/--jobs`, `-w/--wait`, and `-t/--timeout` flags control how aggressively 
 
 - **`-s/--sshpass` (sshpass mode)** - Use `sshpass` to pass passwords instead of the native `SSH_ASKPASS` mechanism. sshpass returns distinct exit codes for auth failure vs connection errors, avoiding the stderr capture overhead used in default mode. Requires `sshpass` installed.
 
-Three internal constants are hardcoded in the script and are not exposed as flags:
+Several internal constants are hardcoded in the script and are not exposed as flags:
 
-- **`RETRY_SLEEP` (0.05s)** - Fixed delay between retries when a connection error occurs. Intentionally short and independent of `--wait` so that transient errors are retried quickly regardless of the configured attack delay.
+- **`RETRY_BACKOFF_BASE_MS` (50ms)** / **`RETRY_BACKOFF_MAX_MS` (5000ms)** - Exponential backoff between retries when a connection error occurs: the wait starts at 50 ms and doubles each retry up to a 5 s cap. It is independent of `--wait` so transient errors are retried quickly, while a sustained block (e.g. `PerSourcePenalties`) is backed off from rather than hammered.
+
+- **`RETRY_MAX_WAIT_MS` (30000ms)** - Cumulative inline retry budget per user/password pair. Once the total backoff for a pair exceeds this (or `--retries` is reached), the pair is deferred to the second-pass retry instead of stalling the whole run. 30 s is chosen to outlast the minimum OpenSSH penalty window.
 
 - **`POLL_SLEEP` (0.05s)** - Fixed delay between checks when waiting for a free job slot (`-j/--jobs` limit). Shorter values reduce slot-acquisition latency; longer values reduce CPU spinning.
 
@@ -369,6 +395,7 @@ After launching an attack, state files are stored per-host in `.getsshpass/<host
 | `resume.txt` | Last attempted `username\tpassword` pair (tab-separated), written before each attempt |
 | `result.txt` | Found credentials, written on success |
 | `filtered_users.txt` | Usernames with password authentication enabled, generated during the filtering step and reused on subsequent runs if present |
+| `skipped.txt` | User/password pairs whose retries were exhausted (typically an OpenSSH 9.8+ `PerSourcePenalties` block dropping the connection). Retried serially in a second pass at the end of the run; any that still fail remain here and the result is reported as inconclusive. Deleted on success. |
 | `filter_tmp/` | Transient directory used during user filtering. Each parallel probe creates a file named after the username (e.g. `filter_tmp/root`) containing the username, only if that user has password authentication enabled. Users that only accept key-based auth get no file. Once all probes finish, the script checks for file existence to rebuild `filtered_users.txt` in original order, then deletes `filter_tmp/`. If interrupted mid-filter the directory is left behind, but the next run removes it at the start of filtering. |
 
 **On interruption** (Ctrl+C, Ctrl+Z, or kill signal), the script cleans up child processes and exits. The `resume.txt` file remains with the last attempted credentials.

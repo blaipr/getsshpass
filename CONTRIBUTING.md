@@ -6,9 +6,10 @@ Thanks for your interest in contributing to getsshpass!
 
 1. **Fork** the repository
 2. **Create a branch** for your change (`git checkout -b my-improvement`)
-3. **Check syntax** with `bash -n src/getsshpass.sh` and lint with [ShellCheck](https://www.shellcheck.net/)
-4. **Test** your changes against a local SSH server you control
-5. **Submit a pull request** with a clear description of what you changed and why
+3. **Check syntax** with `bash -n src/getsshpass.sh` and lint with [ShellCheck](https://www.shellcheck.net/) (must be clean, no suppressions)
+4. **Run the tests** with [bats](https://github.com/bats-core/bats-core): `bats tests/`
+5. **Test** your changes against a local SSH server you control
+6. **Submit a pull request** with a clear description of what you changed and why
 
 ## Guidelines
 
