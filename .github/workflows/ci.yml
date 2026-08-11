@@ -14,14 +14,14 @@ jobs:
     name: Syntax (bash -n)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: bash -n src/getsshpass.sh
 
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: ShellCheck
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
@@ -34,7 +34,7 @@ jobs:
     name: Test (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install bats
         run: sudo apt-get update && sudo apt-get install -y bats
       - name: Show bash version
@@ -46,7 +46,7 @@ jobs:
     name: Test (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # macOS ships bash 3.2; the tool needs bash 4.4+, so install a modern
       # bash (as a macOS user would) and put it first on PATH.
       - name: Install bash + bats
